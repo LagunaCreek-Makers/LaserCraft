@@ -1,0 +1,1 @@
+Phase 34: visual block-style macro editor. WHEN trigger block and ordered DO action blocks, with up/down reordering, delete, enable and save. Existing macro schema and execution preserved. Not a freeform draggable canvas; no live input monitoring, conditions or safety outputs. Rust build not verified.

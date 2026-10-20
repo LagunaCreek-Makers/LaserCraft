@@ -1,0 +1,22 @@
+name: LaserCraft macro compile and tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  macro-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Static macro preflight
+        run: python3 tools/lasercraft_static_check.py
+      - name: Compile application tests
+        run: cargo test -p vectorcraft --no-run --locked
+      - name: Run macro regression tests
+        run: cargo test -p vectorcraft --locked
