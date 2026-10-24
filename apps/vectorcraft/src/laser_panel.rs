@@ -13,6 +13,7 @@ use crate::ruida_monitor;
 use crate::ruida_protocol;
 use egui::{self, Color32};
 use lasercraft_cam::Origin;
+use lasercraft_cam::hooks::job_hooks;
 use lasercraft_core::{Job, Machine, Operation, Point};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -205,11 +206,18 @@ impl LaserPanel {
     fn settings_path() -> Option<PathBuf> {
         lasercraft_cam::default_profiles_path()
     }
-    fn load_profiles(mut self) -> Self {
-        if let Some(path) = Self::settings_path()
-            && let Ok(bytes) = std::fs::read(path)
-            && let Ok(data) = serde_json::from_slice::<Value>(&bytes)
-        {
+    fn load_profiles(self) -> Self {
+        let data = Self::settings_path()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or(Value::Null);
+        self.load_profiles_from(&data)
+    }
+    /// The machines, materials and calibration results of `data` (`profiles.json`, or null when
+    /// there is none), and the machine last loaded loaded again (`active_machine`), so jobs from
+    /// the document are made for it from the start.
+    fn load_profiles_from(mut self, data: &Value) -> Self {
+        if data.is_object() {
             if let Some(p) = data["machines"].as_array() {
                 self.profiles = p.clone();
             }
@@ -229,13 +237,25 @@ impl LaserPanel {
         if self.materials.is_empty() {
             self.materials.push(json!({"name":"Example plywood (UNVERIFIED)","speed":1200.0,"power":35.0,"passes":1,"interval":0.10}));
         }
+        if let Some(name) = data["active_machine"].as_str() {
+            let found = self.profiles.iter().position(|p| p["name"].as_str() == Some(name));
+            match found.map(|i| (i, lasercraft_cam::MachineProfile::from_json(&self.profiles[i]))) {
+                Some((i, Ok(_))) => {
+                    self.active_profile = i;
+                    self.apply_machine();
+                }
+                // Left unloaded: the document section asks for a machine.
+                Some((_, Err(e))) => self.message = format!("The last machine profile could not be loaded: {e}"),
+                None => self.message = format!("The last machine profile `{name}` is no longer saved: load a machine"),
+            }
+        }
         self
     }
     fn save_profiles(&self) -> Result<(), String> {
         let path = Self::settings_path().ok_or("Cannot determine configuration directory")?;
         std::fs::create_dir_all(path.parent().ok_or("Invalid path")?).map_err(|e| e.to_string())?;
         let bytes = serde_json::to_vec_pretty(
-            &json!({"schema_version":1,"machines":self.profiles,"materials":self.materials,"calibration_results":self.test_results}),
+            &json!({"schema_version":1,"machines":self.profiles,"materials":self.materials,"calibration_results":self.test_results,"active_machine":self.loaded_profile}),
         )
         .map_err(|e| e.to_string())?;
         let tmp = path.with_extension("json.tmp");
@@ -287,21 +307,34 @@ impl LaserPanel {
             l.air = serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
         }
     }
-    /// The loaded machine's bed, which jobs from the document are made for (`None`: no machine
-    /// profile loaded yet, so none is guessed).
-    fn bed(&self) -> Option<Bed> {
-        self.loaded_profile.as_ref().map(|_| Bed {
+    /// The loaded machine's bed, which jobs from the document are made for, with its air-assist
+    /// and accessory G-code (`Ok(None)`: no machine profile loaded yet, so none is guessed; an
+    /// error when the air-assist or accessory settings are refused).
+    fn bed(&self) -> Result<Option<Bed>, String> {
+        if self.loaded_profile.is_none() {
+            return Ok(None);
+        }
+        let (prologue, epilogue) = job_hooks(&self.air_config, AirMode::Inherit, &self.accessory_config)?;
+        Ok(Some(Bed {
             width_mm: self.machine_width,
             height_mm: self.machine_height,
             max_s: self.max_s,
             origin: self.machine_origin,
-        })
+            prologue,
+            epilogue,
+        }))
     }
-    /// The document section, and what it asks for: a job from the document goes to the dry run
-    /// (with the machine's air assist and accessory hooks, as the panel's other jobs), and Export
+    /// The document section, and what it asks for: a job from the document (wrapped in the
+    /// machine's air-assist and accessory G-code by the command) goes to the dry run, and Export
     /// G-code asks where to save.
     fn document_section(&mut self, ui: &mut egui::Ui, run: &mut laser_doc::Run) {
-        let bed = self.bed();
+        let bed = match self.bed() {
+            Ok(bed) => bed,
+            Err(e) => {
+                ui.colored_label(vectorcraft_ui_egui::theme::Tokens::get(ui.ctx()).error, format!("Air-assist or accessory settings: {e}"));
+                return;
+            }
+        };
         let name = self.loaded_profile.clone().unwrap_or_default();
         match self.doc_export.ui(ui, run, bed.as_ref(), &name) {
             Some(laser_doc::Action::Generated(g)) => self.take_document_job(g.gcode),
@@ -322,19 +355,15 @@ impl LaserPanel {
             None => {}
         }
     }
+    /// A job from the document (already wrapped in the machine's hooks) goes to the dry run.
     fn take_document_job(&mut self, gcode: String) {
-        match self.air_config.apply(&gcode, AirMode::Inherit).and_then(|code| self.accessory_config.apply(&code)) {
-            Ok(code) => {
-                self.preview = None;
-                self.generated_gcode = code.clone();
-                self.sim_source = code;
-                self.sim_step = 0;
-                self.sim_time = 0.0;
-                self.sim_playing = false;
-                self.message = "Job made from the document; inspect it in the dry run. Not sent to the controller.".into();
-            }
-            Err(e) => self.message = e,
-        }
+        self.preview = None;
+        self.generated_gcode = gcode.clone();
+        self.sim_source = gcode;
+        self.sim_step = 0;
+        self.sim_time = 0.0;
+        self.sim_playing = false;
+        self.message = "Job made from the document; inspect it in the dry run. Not sent to the controller.".into();
     }
     pub fn show(&mut self, ctx: &egui::Context, run: &mut laser_doc::Run) {
         if !self.open {
@@ -478,7 +507,11 @@ impl LaserPanel {
      egui::ComboBox::from_id_salt("lasercraft_machine").selected_text(self.profiles.get(self.active_profile).and_then(|p|p["name"].as_str()).unwrap_or("Select machine")).show_ui(ui,|ui|{
       for (i,p) in self.profiles.iter().enumerate(){ui.selectable_value(&mut self.active_profile,i,p["name"].as_str().unwrap_or("Unnamed"));}
      });
-     if ui.button("Load machine").clicked(){self.apply_machine();}
+     if ui.button("Load machine").clicked(){
+      self.apply_machine();
+      // Remembered: the next start loads it again.
+      if let Err(e)=self.save_profiles(){self.message=format!("Machine loaded, but not remembered: {e}");}
+     }
     });
     ui.horizontal(|ui|{
      ui.label("Controller");
@@ -1189,12 +1222,50 @@ mod tests {
     #[test]
     fn no_bed_until_a_machine_profile_is_loaded() {
         let mut p = LaserPanel { profiles: vec![], loaded_profile: None, ..LaserPanel::default() };
-        assert_eq!(p.bed(), None);
+        assert_eq!(p.bed(), Ok(None));
         p.profiles = vec![json!({"name": "Shop CO2", "controller": "Ruida", "width_mm": 600.0, "height_mm": 400.0, "max_s": 1000})];
         p.active_profile = 0;
         p.apply_machine();
         assert_eq!(p.loaded_profile.as_deref(), Some("Shop CO2"));
-        assert_eq!(p.bed(), Some(Bed { width_mm: 600.0, height_mm: 400.0, max_s: 1000, origin: Origin::TopRight }));
+        let bed = Bed { width_mm: 600.0, height_mm: 400.0, max_s: 1000, origin: Origin::TopRight, prologue: vec![], epilogue: vec![] };
+        assert_eq!(p.bed(), Ok(Some(bed.clone())));
+        // With air assist on, the bed carries its G-code for the command.
+        p.air_config = AirConfig { enabled: true, default_on: true, ..AirConfig::default() };
+        let with_air = p.bed().unwrap().unwrap();
+        assert!(with_air.prologue.iter().any(|l| l == "M8") && with_air.epilogue.iter().any(|l| l == "M9"));
+        // Refused settings are an error, not a job without them.
+        p.air_config.on_command = "G1 X5; M8".into();
+        assert!(p.bed().is_err());
+    }
+
+    fn unloaded() -> LaserPanel {
+        LaserPanel { profiles: vec![], materials: vec![], loaded_profile: None, active_profile: 0, ..LaserPanel::default() }
+    }
+
+    /// The machine loaded last is loaded again at start; a missing or broken one leaves none
+    /// loaded (the document section asks for one) without failing.
+    #[test]
+    fn the_last_machine_is_loaded_at_start() {
+        let machines = json!([
+            {"name": "GRBL 300 x 200", "controller": "GRBL", "width_mm": 300.0, "height_mm": 200.0, "max_s": 1000},
+            {"name": "Shop CO2", "controller": "Ruida", "width_mm": 600.0, "height_mm": 400.0, "origin": "bottomRight"},
+            {"name": "Broken", "width_mm": "wide", "height_mm": 400.0}
+        ]);
+        let p = unloaded().load_profiles_from(&json!({"machines": machines, "active_machine": "Shop CO2"}));
+        assert_eq!(p.loaded_profile.as_deref(), Some("Shop CO2"));
+        assert_eq!(p.active_profile, 1);
+        let bed = p.bed().unwrap().unwrap();
+        assert_eq!((bed.width_mm, bed.height_mm, bed.origin), (600.0, 400.0, Origin::BottomRight));
+        for active in [json!("Gone"), json!("Broken"), json!(42), Value::Null] {
+            let p = unloaded().load_profiles_from(&json!({"machines": machines, "active_machine": active}));
+            assert_eq!(p.loaded_profile, None, "{active}");
+            assert_eq!(p.bed(), Ok(None));
+        }
+        let p = unloaded().load_profiles_from(&json!({"machines": machines, "active_machine": "Gone"}));
+        assert!(p.message.contains("Gone"), "{}", p.message);
+        // No file: the example machine, none loaded.
+        let p = unloaded().load_profiles_from(&Value::Null);
+        assert_eq!((p.profiles.len(), p.loaded_profile.clone()), (1, None));
     }
 
     /// A job from the document goes to the dry run, with the machine's (default, empty) hooks.

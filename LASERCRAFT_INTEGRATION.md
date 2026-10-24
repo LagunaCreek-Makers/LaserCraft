@@ -58,9 +58,12 @@ vectorcraft-cli run --in part.vectorcraft --machine "GRBL 300 x 200" --cmd laser
 The laser panel's **Document → laser job** section makes the job from the open document through
 `laser.exportGcode`, for the loaded machine profile's bed, maximum S and origin. Until a profile is
 loaded (Saved machines → Load machine) it shows the command's "no machine bed size" error instead
-of guessing a size. **Generate from document** sends the job to the dry run (with the machine's
-air-assist and accessory hooks, like the panel's other jobs); **Export G-code…** saves the
-document's job to a file and lists what was left out (images, type, gradients, clipping) or why
+of guessing a size. The machine loaded last is loaded again at start (`active_machine` in
+`profiles.json`). **Generate from document** sends the job to the dry run and **Export G-code…**
+saves it to a file; both carry the machine's air-assist and accessory G-code, which the panel
+passes as `laser.exportGcode`'s `prologue` and `epilogue` (the engine never reads profiles and
+takes only comments, M-codes other than M3/M4 and G4 dwells there). `vectorcraft-cli run
+--machine` passes the profile's the same way. Export lists what was left out (images, type, gradients, clipping) or why
 it was refused (art off the bed). **Document layers** lists the document's layers
 (`laser.layers`) and sets their speed, power, passes and on/off with `laser.setLayer` (one undoable
 step each). The dry run draws the bed with the machine's origin corner. The pasted-SVG section is

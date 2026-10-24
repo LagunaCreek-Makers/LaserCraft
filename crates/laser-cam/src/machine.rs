@@ -7,6 +7,10 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::hooks::accessories::AccessoryConfig;
+use crate::hooks::air::{AirConfig, AirMode};
+use crate::hooks::job_hooks;
+
 /// The corner of the bed the machine counts from. Each axis runs from that corner into the bed:
 /// from a top corner y grows towards the front, from a right corner x grows to the left.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,6 +82,10 @@ pub struct MachineProfile {
     /// The S value of 100 % power (GRBL's `$30`).
     pub max_s: u32,
     pub origin: Origin,
+    /// The G-code its air assist and accessories put before every job ([`crate::hooks`]).
+    pub prologue: Vec<String>,
+    /// … and after it.
+    pub epilogue: Vec<String>,
 }
 
 impl MachineProfile {
@@ -101,7 +109,12 @@ impl MachineProfile {
                 .ok_or_else(|| format!("machine `{name}`: max_s must be a whole number from 1 to {MAX_S}"))?,
         };
         let origin = v["origin"].as_str().and_then(Origin::parse).unwrap_or_else(|| Origin::default_for(&controller));
-        Ok(Self { width_mm: side("width_mm")?, height_mm: side("height_mm")?, max_s, origin, name, controller })
+        // Saved as the laser panel saves them; missing or unreadable ones are off, as the panel
+        // loads them.
+        let air: AirConfig = serde_json::from_value(v["air_assist"].clone()).unwrap_or_default();
+        let accessories: AccessoryConfig = serde_json::from_value(v["accessories"].clone()).unwrap_or_default();
+        let (prologue, epilogue) = job_hooks(&air, AirMode::Inherit, &accessories).map_err(|e| format!("machine `{name}`: {e}"))?;
+        Ok(Self { width_mm: side("width_mm")?, height_mm: side("height_mm")?, max_s, origin, prologue, epilogue, name, controller })
     }
 }
 

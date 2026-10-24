@@ -13,14 +13,17 @@ use vectorcraft_ui_egui::theme::Tokens;
 /// Runs a command by id with its params (the app's `VectorcraftApp::run`).
 pub type Run<'a> = dyn FnMut(&str, Value) -> Result<Value, String> + 'a;
 
-/// The loaded machine profile: the bed a job must fit, the S value of full power and the corner
-/// the machine counts from.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The loaded machine profile: the bed a job must fit, the S value of full power, the corner
+/// the machine counts from, and the air-assist and accessory G-code around each job
+/// (`lasercraft_cam::hooks::job_hooks`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Bed {
     pub width_mm: f64,
     pub height_mm: f64,
     pub max_s: u32,
     pub origin: Origin,
+    pub prologue: Vec<String>,
+    pub epilogue: Vec<String>,
 }
 
 /// Where machine point (`x`, `y`) mm lies on screen when the bed (`w` × `h` mm, centred on
@@ -43,6 +46,8 @@ pub fn export_params(bed: Option<&Bed>, selection_only: bool, tolerance: f64, pa
         p["bedHeight"] = json!(b.height_mm);
         p["maxS"] = json!(b.max_s);
         p["origin"] = json!(b.origin.id());
+        p["prologue"] = json!(b.prologue);
+        p["epilogue"] = json!(b.epilogue);
     }
     if let Some(path) = path {
         p["path"] = json!(path);
@@ -209,7 +214,7 @@ impl DocExport {
         if !self.status.is_empty() {
             ui.small(&self.status);
         }
-        ui.small("The exported file is the document's job only; air assist and accessory hooks are added to the job the panel runs.");
+        ui.small("The machine's air-assist and accessory G-code wraps the job, in the dry run and in the exported file alike.");
         egui::CollapsingHeader::new("Document layers").default_open(true).show(ui, |ui| {
             self.refresh_layers(run);
             if self.layers.is_empty() {
@@ -283,7 +288,7 @@ mod tests {
         }
     }
 
-    const BED: Bed = Bed { width_mm: 300.0, height_mm: 300.0, max_s: 1000, origin: Origin::BottomLeft };
+    const BED: Bed = Bed { width_mm: 300.0, height_mm: 300.0, max_s: 1000, origin: Origin::BottomLeft, prologue: Vec::new(), epilogue: Vec::new() };
 
     #[test]
     fn bed_corners_land_where_each_origin_says() {
@@ -307,7 +312,7 @@ mod tests {
         let p = export_params(Some(&Bed { origin: Origin::TopRight, ..BED }), true, 0.1, Some("a.gcode"));
         assert_eq!(
             p,
-            json!({"selectionOnly": true, "tolerance": 0.1, "bedWidth": 300.0, "bedHeight": 300.0, "maxS": 1000, "origin": "topRight", "path": "a.gcode"})
+            json!({"selectionOnly": true, "tolerance": 0.1, "bedWidth": 300.0, "bedHeight": 300.0, "maxS": 1000, "origin": "topRight", "prologue": [], "epilogue": [], "path": "a.gcode"})
         );
         assert!(export_params(None, false, 0.05, None).get("bedWidth").is_none());
     }
@@ -335,6 +340,20 @@ mod tests {
         s.execute("text.create", &json!({"x": 300, "y": 300, "text": "Hi"})).unwrap();
         d.generate(&mut runner(&mut s), Some(&BED), None).unwrap();
         assert!(d.warnings.iter().any(|w| w.contains("type")), "{:?}", d.warnings);
+    }
+
+    /// The exported file carries the machine's hooks, as the job the panel runs does.
+    #[test]
+    fn exported_file_has_the_machine_hooks() {
+        let mut s = session();
+        let mut d = DocExport::default();
+        let bed = Bed { prologue: vec!["M8".into()], epilogue: vec!["M9".into()], ..BED };
+        let path = std::env::temp_dir().join(format!("lasercraft-panel-air-{}.gcode", std::process::id()));
+        let g = d.generate(&mut runner(&mut s), Some(&bed), path.to_str()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, g.gcode);
+        assert!(text.starts_with("M8\nG21\n") && text.ends_with("M5\nM9\n"), "{text}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

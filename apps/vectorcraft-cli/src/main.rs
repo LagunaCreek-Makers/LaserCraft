@@ -80,7 +80,8 @@ USAGE:
       Headless batch: open FILE (any readable format) or start a new document, run commands in
       order, export each FILE in the format its extension picks (see Writable formats; a .ait FILE
       is a template, written as file.saveAsTemplate writes it). Prints one JSON result per step.
-      --machine NAME gives laser.exportGcode the bed size, maximum S and origin corner of that
+      --machine NAME gives laser.exportGcode the bed size, maximum S, origin corner and air-assist
+      and accessory G-code of that
       LaserCraft machine profile (from FILE, default the laser panel's lasercraft/profiles.json in
       the configuration folder); params given with --params win. Laser G-code from a saved file
       (review it offline; nothing is sent to a machine):
@@ -347,6 +348,9 @@ fn with_machine(params: &mut Value, m: &lasercraft_cam::MachineProfile) {
     o.entry("bedHeight").or_insert(json!(m.height_mm));
     o.entry("maxS").or_insert(json!(m.max_s));
     o.entry("origin").or_insert(json!(m.origin.id()));
+    // Its air-assist and accessory G-code, as the laser panel adds them to the jobs it runs.
+    o.entry("prologue").or_insert(json!(m.prologue));
+    o.entry("epilogue").or_insert(json!(m.epilogue));
 }
 
 fn run(args: &[String]) -> Result<(), String> {

@@ -13,6 +13,44 @@ const EXPORT: &str = "laser.exportGcode";
 const SET: &str = "laser.setLayer";
 
 const NO_BED: &str = "no machine bed size: select a machine profile or pass bedWidth/bedHeight";
+/// Most hook lines (`prologue`, `epilogue`) and their longest line.
+const MAX_HOOK_LINES: usize = 1024;
+const MAX_HOOK_LINE: usize = 120;
+
+/// The G-code lines `key` gives (a machine's air-assist and accessory hooks). Untrusted: only
+/// comments, M-codes that don't switch the laser on (no M3/M4) and G4 dwells, so hooks can't move
+/// the head or fire the laser.
+fn hook_lines(p: &Value, key: &str) -> Result<Vec<String>> {
+    let Some(v) = p.get(key).filter(|v| !v.is_null()) else { return Ok(vec![]) };
+    let lines = v.as_array().ok_or_else(|| bad(EXPORT, format!("{key} must be a list of G-code lines")))?;
+    if lines.len() > MAX_HOOK_LINES {
+        return Err(bad(EXPORT, format!("{key} has more than {MAX_HOOK_LINES} lines")));
+    }
+    lines
+        .iter()
+        .map(|l| {
+            let line = l.as_str().ok_or_else(|| bad(EXPORT, format!("{key} must be a list of G-code lines")))?.trim();
+            if line.len() > MAX_HOOK_LINE || !line.is_ascii() || line.contains(['\n', '\r']) {
+                return Err(bad(EXPORT, format!("{key}: `{line}` is not one ASCII line of at most {MAX_HOOK_LINE} characters")));
+            }
+            let code = line.split(';').next().unwrap_or("").trim().to_ascii_uppercase();
+            let mut words = code.split_whitespace();
+            let allowed = match words.next() {
+                None => true,
+                Some(w) if w.starts_with('M') => w.get(1..).and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| !matches!(n, 3 | 4)),
+                Some(w) if w.starts_with('G') => {
+                    w.get(1..).and_then(|n| n.parse::<u32>().ok()) == Some(4) && words.all(|a| a.starts_with('P') || a.starts_with('S'))
+                }
+                Some(_) => false,
+            };
+            if !allowed {
+                return Err(bad(EXPORT, format!("{key}: `{line}` is not allowed (only comments, M-codes other than M3/M4, and G4 dwells)")));
+            }
+            Ok(line.to_string())
+        })
+        .collect()
+}
+
 /// The spindle value full power is (GRBL's `$30`).
 const DEFAULT_MAX_S: u64 = 1000;
 
@@ -23,7 +61,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Laser G-code",
             [],
             None,
-            "{bedWidth, bedHeight (mm, from the machine profile; art outside the bed is refused), origin?: the machine's corner: bottomLeft (default: x right, y up)|topLeft (x right, y down)|topRight (x left, y down)|bottomRight (x left, y up), maxS?: 1000 (GRBL $30: the S value of 100 % power), path?, selectionOnly?: false, tolerance?: 0.05 (mm curves are flattened to, 0.001 to 5), artboard?: 0 (the bed: the origin is its corner)} → {gcode, warnings, contours, operations, path?, bytes?}. GRBL laser-mode G-code (M4 dynamic power, $32=1) of the visible, printable layers' paths, each layer cut with its laser.setLayer settings (bottom layer first, holes before the outlines around them, then nearest first). Review it before running it: nothing is sent to a machine",
+            "{bedWidth, bedHeight (mm, from the machine profile; art outside the bed is refused), origin?: the machine's corner: bottomLeft (default: x right, y up)|topLeft (x right, y down)|topRight (x left, y down)|bottomRight (x left, y up), maxS?: 1000 (GRBL $30: the S value of 100 % power), path?, selectionOnly?: false, tolerance?: 0.05 (mm curves are flattened to, 0.001 to 5), artboard?: 0 (the bed: the origin is its corner), prologue?: [G-code lines before the job], epilogue?: [lines after it] (the machine's air-assist and accessory hooks: comments, M-codes other than M3/M4, and G4 dwells only; at most 1024 lines of 120 characters)} → {gcode, warnings, contours, operations, path?, bytes?}. GRBL laser-mode G-code (M4 dynamic power, $32=1) of the visible, printable layers' paths, each layer cut with its laser.setLayer settings (bottom layer first, holes before the outlines around them, then nearest first). Review it before running it: nothing is sent to a machine",
             has_doc,
             export_gcode
         ),
@@ -100,7 +138,18 @@ fn export_gcode(s: &mut Session, p: &Value) -> Result<Value> {
         let why = if out.warnings.is_empty() { String::new() } else { format!(" ({})", out.warnings.join("; ")) };
         return Err(bad(EXPORT, format!("nothing to cut: no visible paths on enabled, printable layers{why}")));
     }
-    let gcode = out.job.to_grbl(machine).map_err(|e| bad(EXPORT, plan_error(e)))?;
+    let (prologue, epilogue) = (hook_lines(p, "prologue")?, hook_lines(p, "epilogue")?);
+    let job = out.job.to_grbl(machine).map_err(|e| bad(EXPORT, plan_error(e)))?;
+    let mut gcode = String::with_capacity(job.len());
+    for l in &prologue {
+        gcode.push_str(l);
+        gcode.push('\n');
+    }
+    gcode.push_str(&job);
+    for l in &epilogue {
+        gcode.push_str(l);
+        gcode.push('\n');
+    }
     let mut r = json!({
         "gcode": gcode,
         "warnings": out.warnings,
@@ -296,6 +345,23 @@ mod tests {
         })
         .unwrap();
         assert!(export(&mut s, json!({})).is_err());
+    }
+
+    #[test]
+    fn machine_hooks_wrap_the_job() {
+        let mut s = session();
+        s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap();
+        let r = export(&mut s, json!({"prologue": ["; air assist", "M8", "G4 P0.500"], "epilogue": ["G4 P1.000", "M9"]})).unwrap();
+        let g = r["gcode"].as_str().unwrap();
+        assert!(g.starts_with("; air assist\nM8\nG4 P0.500\nG21\nG90\n"), "{g}");
+        assert!(g.ends_with("M5\nG4 P1.000\nM9\n"), "{g}");
+        // Hooks can't move the head or fire the laser.
+        for bad in ["M3 S1000", "M4", "G1 X10", "G0 X0 Y0", "G4 X5", "$H", "M8\nG1 X5", "T1"] {
+            assert!(export(&mut s, json!({"prologue": [bad]})).is_err(), "{bad}");
+        }
+        assert!(export(&mut s, json!({"epilogue": "M9"})).is_err());
+        assert!(export(&mut s, json!({"epilogue": vec!["M9"; 1025]})).is_err());
+        assert!(export(&mut s, json!({"prologue": ["M106 S255", "M7", ""]})).is_ok());
     }
 
     #[test]
