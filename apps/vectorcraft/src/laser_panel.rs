@@ -1,124 +1,400 @@
-use crate::macro_routines::{RoutineDatabase,Routine,Step,Context,EventBinding};
 //! LaserCraft laser operations editor. Offline-only: no machine motion or firing.
-use egui::{self, Color32};
-use lasercraft_core::{Job, Machine, Operation, Point};
-use serde_json::{json, Value};
-use std::path::PathBuf;
+use crate::accessories::{Accessory, AccessoryConfig, AccessoryMode, AccessoryTransport, send_independent};
+use crate::accessory_lifecycle::{Coordinator, Stage};
+use crate::accessory_macros::{MacroAction, MacroConfig, MacroEvent, MacroRule};
+use crate::air_assist::{AirConfig, AirMode};
+use crate::grbl_monitor::{self, Event, GrblStatus, Monitor};
 use crate::grbl_stream::Progress;
 use crate::laser_sim;
-use crate::air_assist::{AirConfig, AirMode};
-use crate::accessory_lifecycle::{Coordinator,Stage};
-use crate::accessory_macros::{MacroConfig,MacroRule,MacroEvent,MacroAction};
-use crate::accessories::{Accessory, AccessoryConfig, AccessoryMode, AccessoryTransport, send_independent};
-use crate::laser_tests::{self, TestSettings, TestKind, TestResult};
+use crate::laser_tests::{self, TestKind, TestResult, TestSettings};
+use crate::macro_routines::{Context, EventBinding, Routine, RoutineDatabase, Step};
 use crate::ruida_monitor;
 use crate::ruida_protocol;
-use crate::grbl_monitor::{self, Event, Monitor, GrblStatus};
+use egui::{self, Color32};
+use lasercraft_core::{Job, Machine, Operation, Point};
+use serde_json::{Value, json};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode { Line, Fill, FillLine, Image }
-impl Mode { fn label(self)-> &'static str {match self {Self::Line=>"Line",Self::Fill=>"Fill",Self::FillLine=>"Fill + Line",Self::Image=>"Image"}} }
-struct LaserLayer { name:String, color:Color32, enabled:bool, mode:Mode, speed:f64, power:f64, passes:u32, interval:f64, air:AirMode }
-impl LaserLayer { fn new(name:&str,color:Color32)->Self {Self{name:name.into(),color,enabled:true,mode:Mode::Line,speed:1200.0,power:35.0,passes:1,interval:0.10,air:AirMode::Inherit}} }
-pub struct LaserPanel { pub open:bool, layers:Vec<LaserLayer>, selected:usize, machine_width:f64, machine_height:f64, max_s:u32, message:String, svg_source:String, generated_gcode:String, preview:Option<Job>, color_mapping:bool, profiles:Vec<Value>, materials:Vec<Value>, active_profile:usize, active_material:usize, connection_port:String, connection_baud:u32, controller:String, monitor:Option<Monitor>, monitor_status:GrblStatus, monitor_log:Vec<String>, detected_ports:Vec<String>, jog_distance:f64, jog_feed:f64, motion_unlocked:bool, stream_progress:Option<Progress>, stream_armed:bool, ruida_listener:Option<ruida_monitor::Listener>, ruida_port:u16, ruida_log:Vec<String>, ruida_inventory:ruida_monitor::Inventory, ruida_hex_input:String, ruida_inspection:String, sim_step:usize, sim_source:String, sim_playing:bool, sim_time:f64, sim_rate:f64, sim_zoom:f32, sim_pan:egui::Vec2, exposure_resolution:usize, exposure_grayscale:bool, acceleration:f64, test_settings:TestSettings, test_notes:String, test_results:Vec<TestResult>, test_status:String, air_config:AirConfig, accessory_config:AccessoryConfig, coordinator:Coordinator, macros:MacroConfig, macro_log:Vec<String>, macro_text:String, macro_text_message:String, routine_db:RoutineDatabase, routine_text:String, routine_message:String, last_macro_stage:Stage, canvas_drag:Option<crate::macro_canvas::DragState>, canvas_editors:Vec<crate::macro_canvas::CanvasEditorState>, debugger:crate::macro_debugger::Debugger }
-impl Default for LaserPanel {fn default()->Self {Self {open:true,layers:vec![LaserLayer::new("C00",Color32::BLACK),LaserLayer::new("C01",Color32::RED)],selected:0,machine_width:300.0,machine_height:200.0,max_s:1000,message:"Offline mode — no laser is connected".into(),svg_source:String::new(),generated_gcode:String::new(),preview:None,color_mapping:false,profiles:vec![],materials:vec![],active_profile:0,active_material:0,connection_port:String::new(),connection_baud:115200,controller:"GRBL".into(),monitor:None,monitor_status:GrblStatus::default(),monitor_log:Vec::new(),detected_ports:Vec::new(),jog_distance:1.0,jog_feed:300.0,motion_unlocked:false,stream_progress:None,stream_armed:false,ruida_listener:None,ruida_port:50200,ruida_log:Vec::new(),ruida_inventory:ruida_monitor::Inventory::default(),ruida_hex_input:String::new(),ruida_inspection:String::new(),sim_step:0,sim_source:String::new(),sim_playing:false,sim_time:0.0,sim_rate:1.0,sim_zoom:1.0,sim_pan:egui::Vec2::ZERO,exposure_resolution:100,exposure_grayscale:false,acceleration:500.0,test_settings:TestSettings::default(),test_notes:String::new(),test_results:Vec::new(),test_status:String::new(),air_config:AirConfig::default(),accessory_config:AccessoryConfig::default(),coordinator:Coordinator::default(),macros:MacroConfig::default(),macro_log:Vec::new(),macro_text:String::new(),macro_text_message:String::new(),routine_db:RoutineDatabase::default(),routine_text:String::new(),routine_message:String::new(),last_macro_stage:Stage::Idle,canvas_drag:None,canvas_editors:Vec::new(),debugger:Default::default()}.load_profiles()}}}
+enum Mode {
+    Line,
+    Fill,
+    FillLine,
+    Image,
+}
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Line => "Line",
+            Self::Fill => "Fill",
+            Self::FillLine => "Fill + Line",
+            Self::Image => "Image",
+        }
+    }
+}
+struct LaserLayer {
+    name: String,
+    color: Color32,
+    enabled: bool,
+    mode: Mode,
+    speed: f64,
+    power: f64,
+    passes: u32,
+    interval: f64,
+    air: AirMode,
+}
+impl LaserLayer {
+    fn new(name: &str, color: Color32) -> Self {
+        Self {
+            name: name.into(),
+            color,
+            enabled: true,
+            mode: Mode::Line,
+            speed: 1200.0,
+            power: 35.0,
+            passes: 1,
+            interval: 0.10,
+            air: AirMode::Inherit,
+        }
+    }
+}
+pub struct LaserPanel {
+    pub open: bool,
+    layers: Vec<LaserLayer>,
+    selected: usize,
+    machine_width: f64,
+    machine_height: f64,
+    max_s: u32,
+    message: String,
+    svg_source: String,
+    generated_gcode: String,
+    preview: Option<Job>,
+    color_mapping: bool,
+    profiles: Vec<Value>,
+    materials: Vec<Value>,
+    active_profile: usize,
+    active_material: usize,
+    connection_port: String,
+    connection_baud: u32,
+    controller: String,
+    monitor: Option<Monitor>,
+    monitor_status: GrblStatus,
+    monitor_log: Vec<String>,
+    detected_ports: Vec<String>,
+    jog_distance: f64,
+    jog_feed: f64,
+    motion_unlocked: bool,
+    stream_progress: Option<Progress>,
+    stream_armed: bool,
+    ruida_listener: Option<ruida_monitor::Listener>,
+    ruida_port: u16,
+    ruida_log: Vec<String>,
+    ruida_inventory: ruida_monitor::Inventory,
+    ruida_hex_input: String,
+    ruida_inspection: String,
+    sim_step: usize,
+    sim_source: String,
+    sim_playing: bool,
+    sim_time: f64,
+    sim_rate: f64,
+    sim_zoom: f32,
+    sim_pan: egui::Vec2,
+    exposure_resolution: usize,
+    exposure_grayscale: bool,
+    acceleration: f64,
+    test_settings: TestSettings,
+    test_notes: String,
+    test_results: Vec<TestResult>,
+    test_status: String,
+    air_config: AirConfig,
+    accessory_config: AccessoryConfig,
+    coordinator: Coordinator,
+    macros: MacroConfig,
+    macro_log: Vec<String>,
+    macro_text: String,
+    macro_text_message: String,
+    routine_db: RoutineDatabase,
+    routine_text: String,
+    routine_message: String,
+    last_macro_stage: Stage,
+    canvas_drag: Option<crate::macro_canvas::DragState>,
+    canvas_editors: Vec<crate::macro_canvas::CanvasEditorState>,
+    debugger: crate::macro_debugger::Debugger,
+}
+impl Default for LaserPanel {
+    fn default() -> Self {
+        Self {
+            open: true,
+            layers: vec![LaserLayer::new("C00", Color32::BLACK), LaserLayer::new("C01", Color32::RED)],
+            selected: 0,
+            machine_width: 300.0,
+            machine_height: 200.0,
+            max_s: 1000,
+            message: "Offline mode — no laser is connected".into(),
+            svg_source: String::new(),
+            generated_gcode: String::new(),
+            preview: None,
+            color_mapping: false,
+            profiles: vec![],
+            materials: vec![],
+            active_profile: 0,
+            active_material: 0,
+            connection_port: String::new(),
+            connection_baud: 115200,
+            controller: "GRBL".into(),
+            monitor: None,
+            monitor_status: GrblStatus::default(),
+            monitor_log: Vec::new(),
+            detected_ports: Vec::new(),
+            jog_distance: 1.0,
+            jog_feed: 300.0,
+            motion_unlocked: false,
+            stream_progress: None,
+            stream_armed: false,
+            ruida_listener: None,
+            ruida_port: 50200,
+            ruida_log: Vec::new(),
+            ruida_inventory: ruida_monitor::Inventory::default(),
+            ruida_hex_input: String::new(),
+            ruida_inspection: String::new(),
+            sim_step: 0,
+            sim_source: String::new(),
+            sim_playing: false,
+            sim_time: 0.0,
+            sim_rate: 1.0,
+            sim_zoom: 1.0,
+            sim_pan: egui::Vec2::ZERO,
+            exposure_resolution: 100,
+            exposure_grayscale: false,
+            acceleration: 500.0,
+            test_settings: TestSettings::default(),
+            test_notes: String::new(),
+            test_results: Vec::new(),
+            test_status: String::new(),
+            air_config: AirConfig::default(),
+            accessory_config: AccessoryConfig::default(),
+            coordinator: Coordinator::default(),
+            macros: MacroConfig::default(),
+            macro_log: Vec::new(),
+            macro_text: String::new(),
+            macro_text_message: String::new(),
+            routine_db: RoutineDatabase::default(),
+            routine_text: String::new(),
+            routine_message: String::new(),
+            last_macro_stage: Stage::Idle,
+            canvas_drag: None,
+            canvas_editors: Vec::new(),
+            debugger: Default::default(),
+        }
+        .load_profiles()
+    }
+}
 impl LaserPanel {
- fn settings_path() -> Option<PathBuf> {
-  let root = if cfg!(target_os="windows") { std::env::var_os("APPDATA").map(PathBuf::from) }
-   else if cfg!(target_os="macos") { std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support")) }
-   else { std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(||std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".config"))) }?;
-  Some(root.join("lasercraft").join("profiles.json"))
- }
- fn load_profiles(mut self)->Self {
-  if let Some(path)=Self::settings_path(){if let Ok(bytes)=std::fs::read(path){if let Ok(data)=serde_json::from_slice::<Value>(&bytes){
-   if let Some(p)=data["machines"].as_array(){self.profiles=p.clone();}
-   if let Some(m)=data["materials"].as_array(){self.materials=m.clone();}
-   if let Ok(results)=serde_json::from_value::<Vec<TestResult>>(data["calibration_results"].clone()){self.test_results=results;}
-   // Machine-level air-assist settings are applied when the machine profile is loaded.
-  }}}
-  if self.profiles.is_empty(){self.profiles.push(json!({"name":"GRBL 300 x 200", "controller":"GRBL", "width_mm":300.0,"height_mm":200.0,"max_s":1000,"port":"", "baud":115200}));}
-  if self.materials.is_empty(){self.materials.push(json!({"name":"Example plywood (UNVERIFIED)","speed":1200.0,"power":35.0,"passes":1,"interval":0.10}));}
-  self
- }
- fn save_profiles(&self)->Result<(),String>{
-  let path=Self::settings_path().ok_or("Cannot determine configuration directory")?;
-  std::fs::create_dir_all(path.parent().ok_or("Invalid path")?).map_err(|e|e.to_string())?;
-  let bytes=serde_json::to_vec_pretty(&json!({"schema_version":1,"machines":self.profiles,"materials":self.materials,"calibration_results":self.test_results})).map_err(|e|e.to_string())?;
-  let tmp=path.with_extension("json.tmp");
-  std::fs::write(&tmp,bytes).map_err(|e|e.to_string())?;
-  std::fs::rename(&tmp,&path).map_err(|e|e.to_string())
- }
- fn apply_machine(&mut self){if let Some(p)=self.profiles.get(self.active_profile){
-  self.machine_width=p["width_mm"].as_f64().unwrap_or(300.0).clamp(1.0,10000.0);
-  self.machine_height=p["height_mm"].as_f64().unwrap_or(200.0).clamp(1.0,10000.0);
-  self.max_s=p["max_s"].as_u64().unwrap_or(1000).clamp(1,100000) as u32;
-  self.controller=p["controller"].as_str().unwrap_or("GRBL").to_owned();
-  self.connection_port=p["port"].as_str().unwrap_or("").to_owned();
-  self.connection_baud=p["baud"].as_u64().unwrap_or(115200).clamp(1200,1000000) as u32;
-  self.air_config=serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
-  self.accessory_config=serde_json::from_value(p["accessories"].clone()).unwrap_or_default();
-  self.macros=serde_json::from_value(p["macros"].clone()).unwrap_or_default();
-  self.routine_db=serde_json::from_value(p["routines"].clone()).unwrap_or_default();
- }}
- fn run_macro_event(&mut self,event:MacroEvent,input:&str,layer:&str){
-  match self.macros.plan(event,input,layer,&self.accessory_config){
-   Ok(actions)=>{
-    if actions.is_empty(){return;}
-    self.macro_log.push(format!("Queued {} actions for {:?} (command acknowledgement is not output feedback)",actions.len(),event));
-    std::thread::spawn(move||{
-     for action in actions { if let Err(err)=send_independent(&action.device,action.activate) {eprintln!("LaserCraft macro {} failed: {}",action.description,err);break;} }
-    });
-   },Err(err)=>self.macro_log.push(format!("Macro blocked: {err}"))
-  }
- }
- fn apply_material(&mut self){if let (Some(p),Some(l))=(self.materials.get(self.active_material),self.layers.get_mut(self.selected)){
-  l.speed=p["speed"].as_f64().unwrap_or(l.speed).clamp(1.0,30000.0);
-  l.power=p["power"].as_f64().unwrap_or(l.power).clamp(0.0,100.0);
-  l.passes=p["passes"].as_u64().unwrap_or(l.passes as u64).clamp(1,100) as u32;
-  l.interval=p["interval"].as_f64().unwrap_or(l.interval).clamp(0.025,1.0);
-  l.air=serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
- }}
- pub fn show(&mut self,ctx:&egui::Context) {
-  if !self.open {return;}
-  let mut disconnected=false;
-  if let Some(monitor)=&self.monitor {for event in monitor.events.try_iter().take(128){match event {
-   Event::Connected=>self.message="GRBL serial monitor connected (experimental motion controls)".into(),
-   Event::Disconnected(reason)=>{self.message=reason;disconnected=true;},
-   Event::Line(line)=>{if line.starts_with("ALARM:"){self.monitor_status.alarm=Some(line.clone());}self.monitor_log.push(line);},
-   Event::Status(status)=>self.monitor_status=status,
-   Event::Ports(ports)=>self.detected_ports=ports,
-   Event::JobProgress(progress)=>{if progress.failed.is_some()||progress.finished{self.stream_armed=false;}self.stream_progress=Some(progress);},
-  }}}
-  if disconnected{self.monitor=None;self.coordinator.shutdown();}
-  if let Some(result)=self.coordinator.poll(){
-   match result {
-    Ok(()) if self.coordinator.stage==Stage::Ready=>{
-     if let Some(code)=self.coordinator.pending_gcode.take(){
-      if let Some(m)=&self.monitor {match m.start_job(code){Ok(())=>{self.coordinator.mark_running();self.stream_armed=false;self.message="Job queued after accessory startup".into();},Err(e)=>{self.message=e;self.coordinator.shutdown();}}}
-      else {self.message="Laser disconnected during accessory startup".into();self.coordinator.shutdown();}
-     }
-    },
-    Err(e)=>self.message=e,
-    _=>{}
-   }
-  }
-  if self.coordinator.stage==Stage::Running && (self.stream_progress.as_ref().is_some_and(|p|p.failed.is_some()) || self.monitor_status.alarm.is_some()) {self.coordinator.shutdown();}
-  if self.coordinator.stage==Stage::Running && self.stream_progress.as_ref().is_some_and(|p|p.finished) && self.monitor_status.state.eq_ignore_ascii_case("Idle") {self.coordinator.shutdown();}
-  // Event edges are observed after the GRBL coordinator updates. Dispatch never blocks the UI.
-  let stage=self.coordinator.stage;
-  if stage!=self.last_macro_stage {
-   let event=match stage {Stage::Running=>Some(MacroEvent::JobStarted),Stage::Idle if self.last_macro_stage==Stage::Stopping && self.stream_progress.as_ref().is_some_and(|p|p.finished && p.failed.is_none())=>Some(MacroEvent::JobCompleted),Stage::Idle if self.last_macro_stage==Stage::Stopping=>Some(MacroEvent::JobCancelled),Stage::Fault=>Some(MacroEvent::JobFault),_=>None};
-   if let Some(event)=event {self.run_macro_event(event,"","");}
-   self.last_macro_stage=stage;
-  }
-  if self.monitor_log.len()>100{let excess=self.monitor_log.len()-100;self.monitor_log.drain(..excess);}
-  if let Some(listener)=&self.ruida_listener {for event in listener.events.try_iter().take(64){
-   let line=match event {ruida_monitor::Event::Listening(p)=>format!("Listening for UDP datagrams on port {p}"),ruida_monitor::Event::Packet(p)=>{let line=format!("{} | {} bytes | {}",p.source,p.bytes,p.prefix_hex);self.ruida_inventory.record(p);line},ruida_monitor::Event::Error(e)=>format!("Listener error: {e}"),ruida_monitor::Event::Stopped=>"Listener stopped".to_string()};
-   self.ruida_log.push(line);
-  }}
-  if self.ruida_log.len()>100 {let excess=self.ruida_log.len()-100;self.ruida_log.drain(..excess);}
-  let mut open=self.open;
-  egui::Window::new("LaserCraft | Laser Operations").open(&mut open).default_width(350.0).resizable(true).show(ctx,|ui|{
+    fn settings_path() -> Option<PathBuf> {
+        let root = if cfg!(target_os = "windows") {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        } else if cfg!(target_os = "macos") {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        }?;
+        Some(root.join("lasercraft").join("profiles.json"))
+    }
+    fn load_profiles(mut self) -> Self {
+        if let Some(path) = Self::settings_path()
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(data) = serde_json::from_slice::<Value>(&bytes)
+        {
+            if let Some(p) = data["machines"].as_array() {
+                self.profiles = p.clone();
+            }
+            if let Some(m) = data["materials"].as_array() {
+                self.materials = m.clone();
+            }
+            if let Ok(results) = serde_json::from_value::<Vec<TestResult>>(data["calibration_results"].clone()) {
+                self.test_results = results;
+            }
+            // Machine-level air-assist settings are applied when the machine profile is loaded.
+        }
+        if self.profiles.is_empty() {
+            self.profiles.push(
+                json!({"name":"GRBL 300 x 200", "controller":"GRBL", "width_mm":300.0,"height_mm":200.0,"max_s":1000,"port":"", "baud":115200}),
+            );
+        }
+        if self.materials.is_empty() {
+            self.materials.push(json!({"name":"Example plywood (UNVERIFIED)","speed":1200.0,"power":35.0,"passes":1,"interval":0.10}));
+        }
+        self
+    }
+    fn save_profiles(&self) -> Result<(), String> {
+        let path = Self::settings_path().ok_or("Cannot determine configuration directory")?;
+        std::fs::create_dir_all(path.parent().ok_or("Invalid path")?).map_err(|e| e.to_string())?;
+        let bytes = serde_json::to_vec_pretty(
+            &json!({"schema_version":1,"machines":self.profiles,"materials":self.materials,"calibration_results":self.test_results}),
+        )
+        .map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    }
+    fn apply_machine(&mut self) {
+        if let Some(p) = self.profiles.get(self.active_profile) {
+            self.machine_width = p["width_mm"].as_f64().unwrap_or(300.0).clamp(1.0, 10000.0);
+            self.machine_height = p["height_mm"].as_f64().unwrap_or(200.0).clamp(1.0, 10000.0);
+            self.max_s = p["max_s"].as_u64().unwrap_or(1000).clamp(1, 100000) as u32;
+            self.controller = p["controller"].as_str().unwrap_or("GRBL").to_owned();
+            self.connection_port = p["port"].as_str().unwrap_or("").to_owned();
+            self.connection_baud = p["baud"].as_u64().unwrap_or(115200).clamp(1200, 1000000) as u32;
+            self.air_config = serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
+            self.accessory_config = serde_json::from_value(p["accessories"].clone()).unwrap_or_default();
+            self.macros = serde_json::from_value(p["macros"].clone()).unwrap_or_default();
+            self.routine_db = serde_json::from_value(p["routines"].clone()).unwrap_or_default();
+        }
+    }
+    fn run_macro_event(&mut self, event: MacroEvent, input: &str, layer: &str) {
+        match self.macros.plan(event, input, layer, &self.accessory_config) {
+            Ok(actions) => {
+                if actions.is_empty() {
+                    return;
+                }
+                self.macro_log.push(format!("Queued {} actions for {:?} (command acknowledgement is not output feedback)", actions.len(), event));
+                std::thread::spawn(move || {
+                    for action in actions {
+                        if let Err(err) = send_independent(&action.device, action.activate) {
+                            eprintln!("LaserCraft macro {} failed: {}", action.description, err);
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(err) => self.macro_log.push(format!("Macro blocked: {err}")),
+        }
+    }
+    fn apply_material(&mut self) {
+        if let (Some(p), Some(l)) = (self.materials.get(self.active_material), self.layers.get_mut(self.selected)) {
+            l.speed = p["speed"].as_f64().unwrap_or(l.speed).clamp(1.0, 30000.0);
+            l.power = p["power"].as_f64().unwrap_or(l.power).clamp(0.0, 100.0);
+            l.passes = p["passes"].as_u64().unwrap_or(l.passes as u64).clamp(1, 100) as u32;
+            l.interval = p["interval"].as_f64().unwrap_or(l.interval).clamp(0.025, 1.0);
+            l.air = serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
+        }
+    }
+    pub fn show(&mut self, ctx: &egui::Context) {
+        if !self.open {
+            return;
+        }
+        let mut disconnected = false;
+        if let Some(monitor) = &self.monitor {
+            for event in monitor.events.try_iter().take(128) {
+                match event {
+                    Event::Connected => self.message = "GRBL serial monitor connected (experimental motion controls)".into(),
+                    Event::Disconnected(reason) => {
+                        self.message = reason;
+                        disconnected = true;
+                    }
+                    Event::Line(line) => {
+                        if line.starts_with("ALARM:") {
+                            self.monitor_status.alarm = Some(line.clone());
+                        }
+                        self.monitor_log.push(line);
+                    }
+                    Event::Status(status) => self.monitor_status = status,
+                    Event::Ports(ports) => self.detected_ports = ports,
+                    Event::JobProgress(progress) => {
+                        if progress.failed.is_some() || progress.finished {
+                            self.stream_armed = false;
+                        }
+                        self.stream_progress = Some(progress);
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.monitor = None;
+            self.coordinator.shutdown();
+        }
+        if let Some(result) = self.coordinator.poll() {
+            match result {
+                Ok(()) if self.coordinator.stage == Stage::Ready => {
+                    if let Some(code) = self.coordinator.pending_gcode.take() {
+                        if let Some(m) = &self.monitor {
+                            match m.start_job(code) {
+                                Ok(()) => {
+                                    self.coordinator.mark_running();
+                                    self.stream_armed = false;
+                                    self.message = "Job queued after accessory startup".into();
+                                }
+                                Err(e) => {
+                                    self.message = e;
+                                    self.coordinator.shutdown();
+                                }
+                            }
+                        } else {
+                            self.message = "Laser disconnected during accessory startup".into();
+                            self.coordinator.shutdown();
+                        }
+                    }
+                }
+                Err(e) => self.message = e,
+                _ => {}
+            }
+        }
+        if self.coordinator.stage == Stage::Running
+            && (self.stream_progress.as_ref().is_some_and(|p| p.failed.is_some()) || self.monitor_status.alarm.is_some())
+        {
+            self.coordinator.shutdown();
+        }
+        if self.coordinator.stage == Stage::Running
+            && self.stream_progress.as_ref().is_some_and(|p| p.finished)
+            && self.monitor_status.state.eq_ignore_ascii_case("Idle")
+        {
+            self.coordinator.shutdown();
+        }
+        // Event edges are observed after the GRBL coordinator updates. Dispatch never blocks the UI.
+        let stage = self.coordinator.stage;
+        if stage != self.last_macro_stage {
+            let event = match stage {
+                Stage::Running => Some(MacroEvent::JobStarted),
+                Stage::Idle
+                    if self.last_macro_stage == Stage::Stopping
+                        && self.stream_progress.as_ref().is_some_and(|p| p.finished && p.failed.is_none()) =>
+                {
+                    Some(MacroEvent::JobCompleted)
+                }
+                Stage::Idle if self.last_macro_stage == Stage::Stopping => Some(MacroEvent::JobCancelled),
+                Stage::Fault => Some(MacroEvent::JobFault),
+                _ => None,
+            };
+            if let Some(event) = event {
+                self.run_macro_event(event, "", "");
+            }
+            self.last_macro_stage = stage;
+        }
+        if self.monitor_log.len() > 100 {
+            let excess = self.monitor_log.len() - 100;
+            self.monitor_log.drain(..excess);
+        }
+        if let Some(listener) = &self.ruida_listener {
+            for event in listener.events.try_iter().take(64) {
+                let line = match event {
+                    ruida_monitor::Event::Listening(p) => format!("Listening for UDP datagrams on port {p}"),
+                    ruida_monitor::Event::Packet(p) => {
+                        let line = format!("{} | {} bytes | {}", p.source, p.bytes, p.prefix_hex);
+                        self.ruida_inventory.record(p);
+                        line
+                    }
+                    ruida_monitor::Event::Error(e) => format!("Listener error: {e}"),
+                    ruida_monitor::Event::Stopped => "Listener stopped".to_string(),
+                };
+                self.ruida_log.push(line);
+            }
+        }
+        if self.ruida_log.len() > 100 {
+            let excess = self.ruida_log.len() - 100;
+            self.ruida_log.drain(..excess);
+        }
+        let mut open = self.open;
+        egui::Window::new("LaserCraft | Laser Operations").open(&mut open).default_width(350.0).resizable(true).show(ctx,|ui|{
    ui.horizontal(|ui| {ui.heading("Cuts / Layers"); if ui.button("+ Add").clicked(){let idx=self.layers.len();self.layers.push(LaserLayer::new(&format!("C{idx:02}"),Color32::LIGHT_BLUE));self.selected=idx;}});
    egui::ScrollArea::vertical().max_height(190.0).show(ui,|ui|{
     for (i,layer) in self.layers.iter_mut().enumerate(){ui.horizontal(|ui|{ui.checkbox(&mut layer.enabled,"");let (rect,_)=ui.allocate_exact_size(egui::vec2(16.0,16.0),egui::Sense::hover());ui.painter().rect_filled(rect,2.0,layer.color);if ui.selectable_label(self.selected==i,&layer.name).clicked(){self.selected=i;}ui.label(layer.mode.label());});}
@@ -166,11 +442,10 @@ impl LaserPanel {
      });
      if ui.button("Apply to layer").clicked(){self.apply_material();}
     });
-    if ui.button("Save selected layer as material preset").clicked(){
-     if let Some(l)=self.layers.get(self.selected){self.materials.push(json!({"name":format!("Custom material {}",self.materials.len()+1),"speed":l.speed,"power":l.power,"passes":l.passes,"interval":l.interval,"air_assist":l.air}));
+    if ui.button("Save selected layer as material preset").clicked()
+     && let Some(l)=self.layers.get(self.selected){self.materials.push(json!({"name":format!("Custom material {}",self.materials.len()+1),"speed":l.speed,"power":l.power,"passes":l.passes,"interval":l.interval,"air_assist":l.air}));
       self.active_material=self.materials.len()-1;
       self.message=match self.save_profiles(){Ok(())=>"Material preset saved".into(),Err(e)=>format!("Save failed: {e}")};}
-    }
     ui.colored_label(Color32::YELLOW,"GRBL monitor and experimental supervised jogging are available below. Laser firing and job streaming are disabled.");
    });
    ui.collapsing("Phase 28 | Air-assist control",|ui|{
@@ -336,7 +611,7 @@ impl LaserPanel {
        for (i,b) in self.routine_db.bindings.iter_mut().enumerate(){
         ui.push_id(("binding",i),|ui|{ui.horizontal(|ui|{
          ui.checkbox(&mut b.enabled,"");
-         egui::ComboBox::from_id_source("event").selected_text(&b.event).show_ui(ui,|ui|{for e in ["JobStarted","JobCompleted","JobCancelled","JobFault","LayerStarted","InputHigh","InputLow"] {ui.selectable_value(&mut b.event,e.into(),e);}});
+         egui::ComboBox::from_id_salt("event").selected_text(&b.event).show_ui(ui,|ui|{for e in ["JobStarted","JobCompleted","JobCancelled","JobFault","LayerStarted","InputHigh","InputLow"] {ui.selectable_value(&mut b.event,e.into(),e);}});
          ui.label("CALL");ui.text_edit_singleline(&mut b.routine);
          if ui.small_button("Delete").clicked(){remove_binding=Some(i);}
         });});
@@ -545,18 +820,20 @@ impl LaserPanel {
     });
     ui.horizontal(|ui|{
      if self.monitor.is_none(){if ui.add_enabled(self.controller=="GRBL" && !self.connection_port.is_empty(),egui::Button::new("Connect GRBL")).clicked(){self.monitor=Some(Monitor::connect(self.connection_port.clone(),self.connection_baud));}}
-     else if ui.button("Disconnect").clicked(){if let Some(m)=&self.monitor{m.disconnect();}}
+     else if ui.button("Disconnect").clicked()&& let Some(m)=&self.monitor{m.disconnect();}
     });
     ui.separator();
     ui.label("Phase 9 | GRBL 1.1 supervised control (EXPERIMENTAL)");
-    ui.horizontal(|ui|{if ui.button("Identify ($I)").clicked(){if let Some(m)=&self.monitor{m.identify();}} if ui.button("Read settings ($$)").clicked(){if let Some(m)=&self.monitor{m.settings();}}});
-    ui.horizontal(|ui|{if ui.button("Feed hold (!)").clicked(){if let Some(m)=&self.monitor{m.hold();}} if ui.button("Resume (~)").clicked(){if let Some(m)=&self.monitor{m.resume();}}});
+    ui.horizontal(|ui|{if ui.button("Identify ($I)").clicked()&& let Some(m)=&self.monitor{m.identify();}
+      if ui.button("Read settings ($$)").clicked()&& let Some(m)=&self.monitor{m.settings();}});
+    ui.horizontal(|ui|{if ui.button("Feed hold (!)").clicked()&& let Some(m)=&self.monitor{m.hold();}
+      if ui.button("Resume (~)").clicked()&& let Some(m)=&self.monitor{m.resume();}});
     ui.checkbox(&mut self.motion_unlocked,"Enable supervised jogging (machine can move)");
     ui.small("Only use with laser physically disabled, enclosure closed, clear work area, and a reachable hardware E-stop. Software controls are not safety interlocks.");
     ui.horizontal(|ui|{ui.label("Distance mm");ui.add(egui::DragValue::new(&mut self.jog_distance).range(0.1..=10.0));ui.label("Feed mm/min");ui.add(egui::DragValue::new(&mut self.jog_feed).range(1.0..=1000.0));});
     let ready=self.motion_unlocked && self.monitor.is_some() && self.monitor_status.state.eq_ignore_ascii_case("Idle") && self.monitor_status.alarm.is_none();
     ui.horizontal_wrapped(|ui|{for (label,axis,sign) in [("X−",'X',-1.0),("X+",'X',1.0),("Y−",'Y',-1.0),("Y+",'Y',1.0),("Z−",'Z',-1.0),("Z+",'Z',1.0)]{
-     if ui.add_enabled(ready,egui::Button::new(label)).clicked(){if let Some(m)=&self.monitor{if let Err(e)=m.jog(axis,sign*self.jog_distance,self.jog_feed){self.message=e;}}}
+     if ui.add_enabled(ready,egui::Button::new(label)).clicked()&& let Some(m)=&self.monitor&& let Err(e)=m.jog(axis,sign*self.jog_distance,self.jog_feed){self.message=e;}
     }});
     ui.small("Jog is GRBL 1.1 only; position bounds must be enforced by controller soft limits.");
     ui.separator();
@@ -566,14 +843,15 @@ impl LaserPanel {
     let job_active=self.stream_progress.as_ref().is_some_and(|p|p.sent>0&&!p.finished&&p.failed.is_none());
     let can_start=self.stream_armed && !job_active && self.controller=="GRBL" && self.monitor.is_some() && self.monitor_status.state.eq_ignore_ascii_case("Idle") && self.monitor_status.alarm.is_none() && !self.generated_gcode.trim().is_empty();
     ui.horizontal(|ui|{
-     if ui.add_enabled(can_start,egui::Button::new("START LASER JOB")).clicked(){if let Some(m)=&self.monitor{match self.coordinator.start(&self.accessory_config,self.generated_gcode.clone()){Ok(())=>{self.stream_armed=false;self.stream_progress=None;self.message="Starting independent accessories before job".into();},Err(e)=>self.message=e}}}
-     if ui.add_enabled(job_active,egui::Button::new("Cancel / feed hold")).clicked(){if let Some(m)=&self.monitor{m.cancel_job();self.coordinator.shutdown();}}
+     if ui.add_enabled(can_start,egui::Button::new("START LASER JOB")).clicked()&& let Some(_m)=&self.monitor{match self.coordinator.start(&self.accessory_config,self.generated_gcode.clone()){Ok(())=>{self.stream_armed=false;self.stream_progress=None;self.message="Starting independent accessories before job".into();},Err(e)=>self.message=e}}
+     if ui.add_enabled(job_active,egui::Button::new("Cancel / feed hold")).clicked()&& let Some(m)=&self.monitor{m.cancel_job();self.coordinator.shutdown();}
     });
     ui.label(format!("Independent accessory coordinator: {:?}",self.coordinator.stage));
     if self.coordinator.stage==Stage::Fault && ui.button("Acknowledge accessory fault (verify hardware OFF first)").clicked(){self.coordinator.reset_fault();}
     if matches!(self.coordinator.stage,Stage::Running|Stage::Ready|Stage::Starting) && ui.button("Request accessory shutdown").clicked(){self.coordinator.shutdown();if let Some(m)=&self.monitor{m.cancel_job();}}
     for entry in self.coordinator.log.iter().rev().take(4){ui.small(entry);}
-    if let Some(p)=&self.stream_progress{ui.label(format!("GRBL acknowledgements: {} / {} (sent {})",p.acknowledged,p.total,p.sent));ui.add(egui::ProgressBar::new(if p.total==0{0.0}else{p.acknowledged as f32/p.total as f32}).show_percentage());if p.finished{ui.colored_label(Color32::YELLOW,"All lines acknowledged; machine may still be moving. Wait for Idle before approaching.");}if let Some(e)=&p.failed{ui.colored_label(Color32::RED,e);}}
+    if let Some(p)=&self.stream_progress{ui.label(format!("GRBL acknowledgements: {} / {} (sent {})",p.acknowledged,p.total,p.sent));ui.add(egui::ProgressBar::new(if p.total==0{0.0}else{p.acknowledged as f32/p.total as f32}).show_percentage());if p.finished{ui.colored_label(Color32::YELLOW,"All lines acknowledged; machine may still be moving. Wait for Idle before approaching.");}
+      if let Some(e)=&p.failed{ui.colored_label(Color32::RED,e);}}
     ui.label(format!("State: {}",if self.monitor_status.state.is_empty(){"Unknown"}else{&self.monitor_status.state}));
     if let Some(pos)=self.monitor_status.machine_position {ui.label(format!("Machine X {:.3}  Y {:.3}  Z {:.3} mm",pos[0],pos[1],pos[2]));}
     if let Some(pos)=self.monitor_status.work_position {ui.label(format!("Work X {:.3}  Y {:.3}  Z {:.3} mm",pos[0],pos[1],pos[2]));}
@@ -643,7 +921,7 @@ impl LaserPanel {
       ctx.request_repaint();
      }
      ui.horizontal(|ui|{
-      if ui.button(if self.sim_playing{"Pause"}else{"Play"}).clicked(){if self.sim_time>=duration{self.sim_time=0.0;}self.sim_playing=!self.sim_playing;}
+      if ui.button(if self.sim_playing{"Pause"}else{"Play"}).clicked(){if self.sim_time>=duration{self.sim_time=0.0;}self.sim_playing = !self.sim_playing;}
       if ui.button("Stop").clicked(){self.sim_playing=false;self.sim_time=0.0;}
       if ui.button("Previous").clicked(){self.sim_playing=false;self.sim_time=laser_sim::step_start_time(&sim,self.sim_step.saturating_sub(1));}
       if ui.button("Next").clicked(){self.sim_playing=false;self.sim_time=laser_sim::step_end_time(&sim,self.sim_step.min(n-1));}
@@ -659,7 +937,7 @@ impl LaserPanel {
      });
      let (rect,response)=ui.allocate_exact_size(egui::vec2(340.0,240.0),egui::Sense::drag());
      if response.dragged(){self.sim_pan+=response.drag_delta();}
-     if response.hovered(){let scroll=ui.input(|i|i.raw_scroll_delta.y);if scroll!=0.0{self.sim_zoom=(self.sim_zoom*(1.0+scroll*0.001)).clamp(0.5,12.0);}}
+     if response.hovered(){let scroll=ui.input(|i|i.smooth_scroll_delta.y);if scroll!=0.0{self.sim_zoom=(self.sim_zoom*(1.0+scroll*0.001)).clamp(0.5,12.0);}}
      let painter=ui.painter().with_clip_rect(rect);
      painter.rect_filled(rect,0.0,Color32::from_rgb(19,27,35));
      let center=rect.center()+self.sim_pan;
@@ -738,60 +1016,92 @@ impl LaserPanel {
    ui.small(&self.message);
    ui.colored_label(Color32::YELLOW,"No motion or laser firing commands. GRBL monitoring only; Ruida and raster are not implemented.");
   });
-  self.open=open;
- }
+        self.open = open;
+    }
 }
 
 impl LaserPanel {
- pub fn camera_gcode(&self)->&str {if self.sim_source.is_empty(){&self.generated_gcode}else{&self.sim_source}}
- pub fn camera_bed_width(&self)->f64 {self.machine_width}
- pub fn camera_bed_height(&self)->f64 {self.machine_height}
- pub fn camera_max_s(&self)->f64 {self.max_s as f64}
+    pub fn camera_gcode(&self) -> &str {
+        if self.sim_source.is_empty() { &self.generated_gcode } else { &self.sim_source }
+    }
+    pub fn camera_bed_width(&self) -> f64 {
+        self.machine_width
+    }
+    pub fn camera_bed_height(&self) -> f64 {
+        self.machine_height
+    }
+    pub fn camera_max_s(&self) -> f64 {
+        self.max_s as f64
+    }
 }
 
 // Phase 37: recursive, bounded block editor. This modifies the same AST as the JSON editor.
 pub(crate) fn edit_condition(ui: &mut egui::Ui, expr: &mut crate::macro_routines::Expr, depth: usize) {
- use crate::macro_routines::Expr;
- if depth > 10 { ui.label("Expression nesting limit"); return; }
- let mut kind = match expr {Expr::True=>0,Expr::False=>1,Expr::InputEquals{..}=>2,Expr::VariableEquals{..}=>3,Expr::And(_)=>4,Expr::Or(_)=>5,Expr::Not(_)=>6};
- egui::ComboBox::from_id_source(("condition_kind",depth,expr as *const _ as usize)).selected_text(["TRUE","FALSE","INPUT =","VARIABLE =","AND","OR","NOT"][kind]).show_ui(ui,|ui|{
-  for (i,label) in ["TRUE","FALSE","INPUT =","VARIABLE =","AND","OR","NOT"].iter().enumerate(){ui.selectable_value(&mut kind,i,*label);}
- });
- let old_kind=match expr {Expr::True=>0,Expr::False=>1,Expr::InputEquals{..}=>2,Expr::VariableEquals{..}=>3,Expr::And(_)=>4,Expr::Or(_)=>5,Expr::Not(_)=>6};
- if kind!=old_kind {*expr=match kind {0=>Expr::True,1=>Expr::False,2=>Expr::InputEquals{key:"sensor".into(),value:1},3=>Expr::VariableEquals{key:"counter".into(),value:1},4=>Expr::And(vec![Expr::True,Expr::True]),5=>Expr::Or(vec![Expr::True,Expr::False]),_=>Expr::Not(Box::new(Expr::True))};}
- match expr {
-  Expr::InputEquals{key,value}|Expr::VariableEquals{key,value}=>{ui.text_edit_singleline(key);ui.add(egui::DragValue::new(value));},
-  Expr::And(xs)|Expr::Or(xs)=>{let mut remove=None;for (i,x) in xs.iter_mut().enumerate(){ui.horizontal(|ui|{ui.label(format!("{}",i+1));edit_condition(ui,x,depth+1);if ui.small_button("×").clicked(){remove=Some(i);}});}if let Some(i)=remove{xs.remove(i);}if xs.len()<16 && ui.small_button("+ condition").clicked(){xs.push(Expr::True);}},
-  Expr::Not(x)=>edit_condition(ui,x,depth+1),_=>{}
- }
-}
-fn edit_routine_steps(ui:&mut egui::Ui,steps:&mut Vec<Step>,depth:usize){
- if depth>10 {ui.label("Block nesting limit");return;}
- let mut remove=None;let mut move_step=None;let total=steps.len();
- for (i,step) in steps.iter_mut().enumerate(){
-  ui.push_id(("block",depth,i),|ui|{ui.group(|ui|{
-   ui.horizontal(|ui|{ui.strong(format!("{}",i+1));if ui.small_button("↑").clicked()&&i>0{move_step=Some((i,i-1));}if ui.small_button("↓").clicked()&&i+1<total{move_step=Some((i,i+1));}if ui.small_button("Delete").clicked(){remove=Some(i);}});
-   match step {
-    Step::SetOn{device}=>{ui.horizontal(|ui|{ui.label("ON device");ui.add(egui::DragValue::new(device).clamp_range(0..=255));});},
-    Step::SetOff{device}=>{ui.horizontal(|ui|{ui.label("OFF device");ui.add(egui::DragValue::new(device).clamp_range(0..=255));});},
-    Step::SetPwm{device,percent}=>{ui.horizontal(|ui|{ui.label("PWM device");ui.add(egui::DragValue::new(device).clamp_range(0..=255));ui.label("percent");ui.add(egui::Slider::new(percent,0..=100));});},
-    Step::WaitMs{ms}=>{ui.horizontal(|ui|{ui.label("WAIT ms");ui.add(egui::DragValue::new(ms).clamp_range(0..=60000));});},
-    Step::SetVariable{name,value}=>{ui.horizontal(|ui|{ui.label("SET variable");ui.text_edit_singleline(name);ui.add(egui::DragValue::new(value));});},
-    Step::Call{routine}=>{ui.horizontal(|ui|{ui.label("CALL routine");ui.text_edit_singleline(routine);});},
-    Step::Repeat{times,steps:body}=>{ui.horizontal(|ui|{ui.label("REPEAT");ui.add(egui::DragValue::new(times).clamp_range(0..=100));ui.label("times");});ui.indent("repeat_body",|ui|edit_routine_steps(ui,body,depth+1));},
-    Step::If{condition,then_steps,else_steps}=>{ui.label("IF");edit_condition(ui,condition,0);ui.indent("then",|ui|{ui.label("THEN");edit_routine_steps(ui,then_steps,depth+1);});ui.indent("else",|ui|{ui.label("ELSE");edit_routine_steps(ui,else_steps,depth+1);});},
-   }
-  });});
- }
- if let Some(i)=remove{steps.remove(i);}else if let Some((a,b))=move_step{steps.swap(a,b);}
- if steps.len()<256 {ui.horizontal_wrapped(|ui|{
-  if ui.small_button("+ ON").clicked(){steps.push(Step::SetOn{device:0});}
-  if ui.small_button("+ OFF").clicked(){steps.push(Step::SetOff{device:0});}
-  if ui.small_button("+ PWM").clicked(){steps.push(Step::SetPwm{device:0,percent:50});}
-  if ui.small_button("+ WAIT").clicked(){steps.push(Step::WaitMs{ms:1000});}
-  if ui.small_button("+ IF/ELSE").clicked(){steps.push(Step::If{condition:crate::macro_routines::Expr::True,then_steps:vec![],else_steps:vec![]});}
-  if ui.small_button("+ REPEAT").clicked(){steps.push(Step::Repeat{times:2,steps:vec![]});}
-  if ui.small_button("+ CALL").clicked(){steps.push(Step::Call{routine:String::new()});}
-  if ui.small_button("+ VARIABLE").clicked(){steps.push(Step::SetVariable{name:"counter".into(),value:0});}
- });}
+    use crate::macro_routines::Expr;
+    if depth > 10 {
+        ui.label("Expression nesting limit");
+        return;
+    }
+    let mut kind = match expr {
+        Expr::True => 0,
+        Expr::False => 1,
+        Expr::InputEquals { .. } => 2,
+        Expr::VariableEquals { .. } => 3,
+        Expr::And(_) => 4,
+        Expr::Or(_) => 5,
+        Expr::Not(_) => 6,
+    };
+    egui::ComboBox::from_id_salt(("condition_kind", depth, expr as *const _ as usize))
+        .selected_text(["TRUE", "FALSE", "INPUT =", "VARIABLE =", "AND", "OR", "NOT"][kind])
+        .show_ui(ui, |ui| {
+            for (i, label) in ["TRUE", "FALSE", "INPUT =", "VARIABLE =", "AND", "OR", "NOT"].iter().enumerate() {
+                ui.selectable_value(&mut kind, i, *label);
+            }
+        });
+    let old_kind = match expr {
+        Expr::True => 0,
+        Expr::False => 1,
+        Expr::InputEquals { .. } => 2,
+        Expr::VariableEquals { .. } => 3,
+        Expr::And(_) => 4,
+        Expr::Or(_) => 5,
+        Expr::Not(_) => 6,
+    };
+    if kind != old_kind {
+        *expr = match kind {
+            0 => Expr::True,
+            1 => Expr::False,
+            2 => Expr::InputEquals { key: "sensor".into(), value: 1 },
+            3 => Expr::VariableEquals { key: "counter".into(), value: 1 },
+            4 => Expr::And(vec![Expr::True, Expr::True]),
+            5 => Expr::Or(vec![Expr::True, Expr::False]),
+            _ => Expr::Not(Box::new(Expr::True)),
+        };
+    }
+    match expr {
+        Expr::InputEquals { key, value } | Expr::VariableEquals { key, value } => {
+            ui.text_edit_singleline(key);
+            ui.add(egui::DragValue::new(value));
+        }
+        Expr::And(xs) | Expr::Or(xs) => {
+            let mut remove = None;
+            for (i, x) in xs.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}", i + 1));
+                    edit_condition(ui, x, depth + 1);
+                    if ui.small_button("×").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                xs.remove(i);
+            }
+            if xs.len() < 16 && ui.small_button("+ condition").clicked() {
+                xs.push(Expr::True);
+            }
+        }
+        Expr::Not(x) => edit_condition(ui, x, depth + 1),
+        _ => {}
+    }
 }

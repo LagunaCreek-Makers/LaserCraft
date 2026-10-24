@@ -24,6 +24,7 @@ vectorcraft-text = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wayland", "x11"] }
 egui = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 serialport = { version = "4.6", default-features = false }
 log = { workspace = true }
 

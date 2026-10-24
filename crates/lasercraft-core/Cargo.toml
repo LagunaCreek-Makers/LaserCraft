@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 roxmltree = "0.20"
 svgtypes = "0.15"
+
+[lints]
+workspace = true

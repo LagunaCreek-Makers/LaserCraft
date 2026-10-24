@@ -1,22 +1,21 @@
 //! LaserCraft Phase 19: offline USB-camera snapshot alignment and G-code placement preview.
 //! Calibration is visual-only; it cannot certify real-world alignment or machine safety.
-use egui::{self, Color32, Pos2, Rect, Sense, Stroke, TextureHandle};
-use crate::laser_sim;
 use crate::camera_calibration::Homography;
 use crate::camera_lens::Lens;
 use crate::camera_validation;
+use crate::laser_sim;
+use egui::{self, Color32, Pos2, Rect, Sense, Stroke, TextureHandle};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub struct CameraOverlay {
     pub open: bool,
-    source: String,
     device: String,
     image_path: String,
     texture: Option<TextureHandle>,
-    image_size: [usize;2],
-    corners: Vec<[f32;2]>, // normalized image-space: bed BL, BR, TR, TL
+    image_size: [usize; 2],
+    corners: Vec<[f32; 2]>, // normalized image-space: bed BL, BR, TR, TL
     calibrating: bool,
     opacity: f32,
     error: String,
@@ -34,33 +33,73 @@ pub struct CameraOverlay {
     validation_report: String,
 }
 impl Default for CameraOverlay {
-    fn default()->Self {Self {open:false,source:"File / snapshot".into(),device:"/dev/video0".into(),image_path:String::new(),texture:None,image_size:[0,0],corners:Vec::new(),calibrating:false,opacity:0.7,error:String::new(),show_travel:true,offset_x:0.0,offset_y:0.0,live:false,frame_receiver:None,last_capture:None,capture_interval_ms:750,drag_origin:None,lens:Lens::default(),lens_enabled:false,validation_csv:String::new(),validation_report:String::new()}}
-}
-impl CameraOverlay {
-    fn load(&mut self,ctx:&egui::Context,path:PathBuf) {
-        match image::open(&path) {
-            Ok(img)=>{
-                let rgba=img.to_rgba8();let size=[rgba.width() as usize,rgba.height() as usize];
-                let ci=egui::ColorImage::from_rgba_unmultiplied(size,rgba.as_raw());
-                self.texture=Some(ctx.load_texture("lasercraft_camera_snapshot",ci,egui::TextureOptions::LINEAR));
-                self.image_size=size;self.image_path=path.to_string_lossy().into_owned();
-                self.corners.clear();self.calibrating=false;self.error.clear();
-            },Err(e)=>self.error=format!("Cannot decode camera image: {e}")
+    fn default() -> Self {
+        Self {
+            open: false,
+            device: "/dev/video0".into(),
+            image_path: String::new(),
+            texture: None,
+            image_size: [0, 0],
+            corners: Vec::new(),
+            calibrating: false,
+            opacity: 0.7,
+            error: String::new(),
+            show_travel: true,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            live: false,
+            frame_receiver: None,
+            last_capture: None,
+            capture_interval_ms: 750,
+            drag_origin: None,
+            lens: Lens::default(),
+            lens_enabled: false,
+            validation_csv: String::new(),
+            validation_report: String::new(),
         }
     }
-    fn capture(&mut self,ctx:&egui::Context) {
+}
+impl CameraOverlay {
+    fn load(&mut self, ctx: &egui::Context, path: PathBuf) {
+        match image::open(&path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                self.texture = Some(ctx.load_texture("lasercraft_camera_snapshot", ci, egui::TextureOptions::LINEAR));
+                self.image_size = size;
+                self.image_path = path.to_string_lossy().into_owned();
+                self.corners.clear();
+                self.calibrating = false;
+                self.error.clear();
+            }
+            Err(e) => self.error = format!("Cannot decode camera image: {e}"),
+        }
+    }
+    fn capture(&mut self, ctx: &egui::Context) {
         // ffmpeg must be installed. Capture is a single still, not a live feed.
-        let out=std::env::temp_dir().join("lasercraft-camera-snapshot.png");
-        let mut cmd=std::process::Command::new("ffmpeg");
+        let out = std::env::temp_dir().join("lasercraft-camera-snapshot.png");
+        let mut cmd = std::process::Command::new("ffmpeg");
         cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-y");
-        if cfg!(target_os="linux") {cmd.args(["-f","v4l2","-i",&self.device]);}
-        else if cfg!(target_os="windows") {cmd.args(["-f","dshow","-i",&format!("video={}",self.device)]);}
-        else {cmd.args(["-f","avfoundation","-i",&self.device]);}
-        cmd.args(["-frames:v","1"]);cmd.arg(&out);
-        match cmd.output() {Ok(o) if o.status.success()=>self.load(ctx,out),Ok(o)=>self.error=format!("Camera capture failed: {}",String::from_utf8_lossy(&o.stderr)),Err(e)=>self.error=format!("Cannot start ffmpeg: {e}")}
+        if cfg!(target_os = "linux") {
+            cmd.args(["-f", "v4l2", "-i", &self.device]);
+        } else if cfg!(target_os = "windows") {
+            cmd.args(["-f", "dshow", "-i", &format!("video={}", self.device)]);
+        } else {
+            cmd.args(["-f", "avfoundation", "-i", &self.device]);
+        }
+        cmd.args(["-frames:v", "1"]);
+        cmd.arg(&out);
+        match cmd.output() {
+            Ok(o) if o.status.success() => self.load(ctx, out),
+            Ok(o) => self.error = format!("Camera capture failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) => self.error = format!("Cannot start ffmpeg: {e}"),
+        }
     }
     fn start_async_capture(&mut self) {
-        if self.frame_receiver.is_some() { return; }
+        if self.frame_receiver.is_some() {
+            return;
+        }
         let device = self.device.clone();
         let (tx, rx) = mpsc::channel();
         self.frame_receiver = Some(rx);
@@ -68,14 +107,18 @@ impl CameraOverlay {
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new("ffmpeg");
             cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-            if cfg!(target_os="linux") { cmd.args(["-f", "v4l2", "-i", &device]); }
-            else if cfg!(target_os="windows") { cmd.args(["-f", "dshow", "-i", &format!("video={device}")]); }
-            else { cmd.args(["-f", "avfoundation", "-i", &device]); }
+            if cfg!(target_os = "linux") {
+                cmd.args(["-f", "v4l2", "-i", &device]);
+            } else if cfg!(target_os = "windows") {
+                cmd.args(["-f", "dshow", "-i", &format!("video={device}")]);
+            } else {
+                cmd.args(["-f", "avfoundation", "-i", &device]);
+            }
             cmd.args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]);
-            let result = cmd.output().map_err(|e|e.to_string()).and_then(|out| {
-                if out.status.success() { Ok(out.stdout) }
-                else { Err(String::from_utf8_lossy(&out.stderr).into_owned()) }
-            });
+            let result = cmd
+                .output()
+                .map_err(|e| e.to_string())
+                .and_then(|out| if out.status.success() { Ok(out.stdout) } else { Err(String::from_utf8_lossy(&out.stderr).into_owned()) });
             let _ = tx.send(result);
         });
     }
@@ -87,37 +130,51 @@ impl CameraOverlay {
                     match result {
                         Ok(bytes) => match image::load_from_memory(&bytes) {
                             Ok(img) => {
-                                let rgba=img.to_rgba8();
-                                let size=[rgba.width() as usize,rgba.height() as usize];
-                                let ci=egui::ColorImage::from_rgba_unmultiplied(size,rgba.as_raw());
-                                self.texture=Some(ctx.load_texture("lasercraft_live_camera",ci,egui::TextureOptions::LINEAR));
-                                if self.image_size != size { self.corners.clear(); }
-                                self.image_size=size;
+                                let rgba = img.to_rgba8();
+                                let size = [rgba.width() as usize, rgba.height() as usize];
+                                let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                                self.texture = Some(ctx.load_texture("lasercraft_live_camera", ci, egui::TextureOptions::LINEAR));
+                                if self.image_size != size {
+                                    self.corners.clear();
+                                }
+                                self.image_size = size;
                                 self.error.clear();
-                            },
-                            Err(e) => self.error=format!("Cannot decode webcam frame: {e}"),
+                            }
+                            Err(e) => self.error = format!("Cannot decode webcam frame: {e}"),
                         },
-                        Err(e) => {self.error=format!("Webcam capture failed: {e}");self.live=false;}
+                        Err(e) => {
+                            self.error = format!("Webcam capture failed: {e}");
+                            self.live = false;
+                        }
                     }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {self.frame_receiver=None;self.live=false;self.error="Camera capture worker stopped".into();}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.frame_receiver = None;
+                    self.live = false;
+                    self.error = "Camera capture worker stopped".into();
+                }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         if self.live {
-            let due=self.last_capture.map_or(true,|t|t.elapsed()>=Duration::from_millis(self.capture_interval_ms));
-            if due && self.frame_receiver.is_none() {self.start_async_capture();}
+            let due = self.last_capture.is_none_or(|t| t.elapsed() >= Duration::from_millis(self.capture_interval_ms));
+            if due && self.frame_receiver.is_none() {
+                self.start_async_capture();
+            }
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
-    pub fn show(&mut self,ctx:&egui::Context,gcode:&str,bed_w:f64,bed_h:f64,max_s:f64) {
-        if !self.open {self.live=false;return;}
+    pub fn show(&mut self, ctx: &egui::Context, gcode: &str, bed_w: f64, bed_h: f64, max_s: f64) {
+        if !self.open {
+            self.live = false;
+            return;
+        }
         self.poll_capture(ctx);
-        let mut open=self.open;
+        let mut open = self.open;
         egui::Window::new("LaserCraft | Camera Placement").open(&mut open).default_width(690.0).resizable(true).show(ctx,|ui|{
             ui.label("USB webcam snapshot / workpiece placement. OFFLINE preview only; never moves or fires the laser.");
             ui.horizontal(|ui|{
-                if ui.button("Open image…").clicked(){if let Some(path)=rfd::FileDialog::new().add_filter("Images", &["png","jpg","jpeg","webp"]).pick_file(){self.load(ctx,path);}}
+                if ui.button("Open image…").clicked()&& let Some(path)=rfd::FileDialog::new().add_filter("Images", &["png","jpg","jpeg","webp"]).pick_file(){self.load(ctx,path);}
                 if ui.button("Capture USB webcam still").clicked(){self.capture(ctx);}
             });
             ui.horizontal(|ui|{ui.label("Camera device");ui.text_edit_singleline(&mut self.device);});
@@ -132,8 +189,8 @@ impl CameraOverlay {
                 ui.horizontal(|ui| {ui.label("Tangential p1/p2");ui.add(egui::DragValue::new(&mut self.lens.p1).speed(0.0001));ui.add(egui::DragValue::new(&mut self.lens.p2).speed(0.0001));});
                 ui.horizontal(|ui| {ui.label("Principal cx/cy");ui.add(egui::DragValue::new(&mut self.lens.cx).speed(0.001));ui.add(egui::DragValue::new(&mut self.lens.cy).speed(0.001));});
                 ui.horizontal(|ui| {ui.label("Focal fx/fy");ui.add(egui::DragValue::new(&mut self.lens.fx).speed(0.001));ui.add(egui::DragValue::new(&mut self.lens.fy).speed(0.001));});
-                if ui.button("Import automatic checkerboard calibration…").clicked() {
-                    if let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+                if ui.button("Import automatic checkerboard calibration…").clicked()
+                    && let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
                         let result=(|| -> Result<(Lens,f64),String> {
                             let raw=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
                             let v:serde_json::Value=serde_json::from_str(&raw).map_err(|e|e.to_string())?;
@@ -152,7 +209,6 @@ impl CameraOverlay {
                         })();
                         match result {Ok((lens,rms))=>{self.lens=lens;self.lens_enabled=true;self.corners.clear();self.error=format!("Imported lens calibration (RMS {rms:.3}px). Recalibrate bed corners and validate independent points.");},Err(e)=>self.error=format!("Calibration import rejected: {e}")}
                     }
-                }
                 if ui.button("Reset lens coefficients").clicked(){self.lens=Lens::default();self.lens_enabled=false;}
                 ui.small("Coefficients must be measured from a calibration target. This is not automatic checkerboard detection.");
             });
@@ -170,14 +226,13 @@ impl CameraOverlay {
             if self.corners.len()==4 {ui.colored_label(Color32::LIGHT_GREEN,"Projective bed mapping active (lens distortion NOT corrected). Verify against measured reference points.");}
             ui.horizontal(|ui| {ui.label("Artwork placement offset (mm)");ui.add(egui::DragValue::new(&mut self.offset_x).speed(0.1).prefix("X "));ui.add(egui::DragValue::new(&mut self.offset_y).speed(0.1).prefix("Y "));});
             ui.horizontal(|ui| {
-                if ui.button("Save calibration…").clicked() && self.corners.len()==4 {
-                    if let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).save_file(){
+                if ui.button("Save calibration…").clicked() && self.corners.len()==4
+                    && let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).save_file(){
                         let data=serde_json::json!({"version":1,"image_size":self.image_size,"bed_width_mm":bed_w,"bed_height_mm":bed_h,"corners":self.corners,"lens_enabled":self.lens_enabled,"lens":[self.lens.k1,self.lens.k2,self.lens.p1,self.lens.p2,self.lens.cx,self.lens.cy,self.lens.fx,self.lens.fy]});
                         if let Err(e)=std::fs::write(path,data.to_string()){self.error=e.to_string();}
                     }
-                }
-                if ui.button("Load calibration…").clicked(){
-                    if let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file(){
+                if ui.button("Load calibration…").clicked()
+                    && let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file(){
                         match std::fs::read_to_string(path).ok().and_then(|s|serde_json::from_str::<serde_json::Value>(&s).ok()) {
                             Some(v) => {
                                 let parsed=(|| -> Option<Vec<[f32;2]>> {
@@ -189,27 +244,25 @@ impl CameraOverlay {
                                 })();
                                 if let Some(c)=parsed {
                                     self.corners=c;self.calibrating=false;
-                                    if let Some(a)=v["lens"].as_array() {if a.len()==8 {
+                                    if let Some(a)=v["lens"].as_array()&& a.len()==8 {
                                         let vals:Vec<f64>=a.iter().filter_map(|x|x.as_f64()).collect();
                                         if vals.len()==8 {let lens=Lens{k1:vals[0],k2:vals[1],p1:vals[2],p2:vals[3],cx:vals[4],cy:vals[5],fx:vals[6],fy:vals[7]};if lens.valid(){self.lens=lens;self.lens_enabled=v["lens_enabled"].as_bool().unwrap_or(false);}}
-                                    }}
+                                    }
                                 } else {self.error="Calibration does not match current image size or bed dimensions".into();}
                             },None=>self.error="Cannot read calibration JSON".into()
                         }
                     }
-                }
             });
             let Some(tex)=&self.texture else {ui.label("Open an image or capture a webcam still to begin.");return;};
-            let size=tex.size_vec2();let width=ui.available_width().min(760.0).max(250.0);
+            let size=tex.size_vec2();let width=ui.available_width().clamp(250.0, 760.0);
             let desired=egui::vec2(width,width*size.y/size.x);
             let (rect,response)=ui.allocate_exact_size(desired,Sense::click_and_drag());
             ui.painter().image(tex.id(),rect,Rect::from_min_max(Pos2::ZERO,egui::pos2(1.0,1.0)),Color32::WHITE.gamma_multiply(self.opacity));
-            if self.calibrating && response.clicked(){
-                if let Some(pos)=response.interact_pointer_pos(){
+            if self.calibrating && response.clicked()
+                && let Some(pos)=response.interact_pointer_pos(){
                     self.corners.push([((pos.x-rect.min.x)/rect.width()).clamp(0.0,1.0),((pos.y-rect.min.y)/rect.height()).clamp(0.0,1.0)]);
                     if self.corners.len()==4 {self.calibrating=false;}
                 }
-            }
             for (i,p) in self.corners.iter().enumerate(){
                 let pos=egui::pos2(rect.left()+p[0]*rect.width(),rect.top()+p[1]*rect.height());
                 ui.painter().circle_filled(pos,5.0,Color32::YELLOW);
@@ -241,8 +294,8 @@ impl CameraOverlay {
             };
             if !self.calibrating {
                 if response.drag_started() {self.drag_origin=Some((self.offset_x,self.offset_y));}
-                if response.dragged() {
-                    if let Some((ox,oy))=self.drag_origin {
+                if response.dragged()
+                    && let Some((ox,oy))=self.drag_origin {
                         let d=response.drag_delta();
                         let du=d.x as f64/rect.width() as f64;
                         let dv=d.y as f64/rect.height() as f64;
@@ -255,7 +308,6 @@ impl CameraOverlay {
                             self.offset_y=oy+b.1-a.1;
                         }
                     }
-                }
                 if response.drag_stopped() {self.drag_origin=None;}
             }
             let painter=ui.painter().with_clip_rect(rect);
@@ -270,7 +322,9 @@ impl CameraOverlay {
             if !sim.warnings.is_empty(){ui.colored_label(Color32::YELLOW,sim.warnings.iter().take(3).cloned().collect::<Vec<_>>().join(" | "));}
             ui.small("Camera alignment is approximate. Lens distortion, perspective, camera movement and workpiece height cause positioning errors. Recalibrate whenever the camera moves. Never trust this preview alone for cutting.");
         });
-        self.open=open;
-        if !self.open {self.live=false;}
+        self.open = open;
+        if !self.open {
+            self.live = false;
+        }
     }
 }
