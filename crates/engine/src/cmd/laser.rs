@@ -70,7 +70,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Laser Layer Settings",
             [],
             None,
-            "{layer: layer id, speed?: mm/min (default 1000), power?: 0–100 % (default 20), passes?: 1–100 (default 1), enabled?: true, mode?: line, clear?: false (back to the defaults)} → {layer, speed, power, passes, enabled, mode}. Values not given keep the layer's current ones. Saved with the document",
+            "{layer: layer id, speed?: mm/min (default 1000), power?: 0–100 % (default 20), passes?: 1–100 (default 1), enabled?: true, mode?: line (cut along the paths, default)|fill (engrave inside closed shapes with scan lines), interval?: fill line spacing (0.01–10 mm; default 0.1), angle?: fill line angle (degrees counter-clockwise; default 0: horizontal), bidirectional?: true (every other fill line runs back), overscan?: 0–50 mm the head runs past each fill line at power 0 (default 0; shortened at the bed's edges), crosshatch?: false (fill again at right angles), clear?: false (back to the defaults)} → {layer, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch}. Values not given keep the layer's current ones. Saved with the document",
             has_doc,
             set_layer
         ),
@@ -79,7 +79,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Laser Layers",
             [],
             None,
-            "{} → {layers: [{layer, name, speed, power, passes, enabled, mode, custom}]}: every layer (sublayers too) with the laser settings it cuts with, top-level layers bottom first",
+            "{} → {layers: [{layer, name, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, custom}]}: every layer (sublayers too) with the laser settings it cuts with, top-level layers bottom first",
             has_doc,
             list_layers
         ),
@@ -131,8 +131,14 @@ fn export_gcode(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         None
     };
-    let o =
-        JobOptions { tolerance_mm: f64_or(p, "tolerance", JobOptions::default().tolerance_mm), origin, artboard, selection, ..JobOptions::default() };
+    let o = JobOptions {
+        tolerance_mm: f64_or(p, "tolerance", JobOptions::default().tolerance_mm),
+        origin,
+        artboard,
+        selection,
+        bed: Some((machine.width_mm, machine.height_mm)),
+        ..JobOptions::default()
+    };
     let out = lasercraft_cam::document_to_job(&s.doc()?.doc, &o).map_err(|e| bad(EXPORT, e))?;
     if out.job.operations.is_empty() {
         let why = if out.warnings.is_empty() { String::new() } else { format!(" ({})", out.warnings.join("; ")) };
@@ -172,11 +178,16 @@ fn settings_json(id: NodeId, s: &LayerSettings) -> Value {
         "passes": s.passes,
         "enabled": s.enabled,
         "mode": s.mode.id(),
+        "interval": s.interval_mm,
+        "angle": s.angle_deg,
+        "bidirectional": s.bidirectional,
+        "overscan": s.overscan_mm,
+        "crosshatch": s.crosshatch,
     })
 }
 
 fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
-    check_numbers(p, &["speed", "power", "passes"], SET)?;
+    check_numbers(p, &["speed", "power", "passes", "interval", "angle", "overscan"], SET)?;
     let layer = p.get("layer").ok_or_else(|| bad(SET, "missing `layer` (a layer id)"))?;
     let id = checked_id(s, layer, SET)?;
     let doc = &s.doc()?.doc;
@@ -193,13 +204,18 @@ fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(n) = p.get("passes").filter(|n| !n.is_null()) {
             v.passes = n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(SET, "passes must be a whole number"))?;
         }
-        match p.get("enabled") {
-            None | Some(Value::Null) => {}
-            Some(Value::Bool(b)) => v.enabled = *b,
-            Some(_) => return Err(bad(SET, "enabled must be true or false")),
+        for (key, field) in [("enabled", &mut v.enabled), ("bidirectional", &mut v.bidirectional), ("crosshatch", &mut v.crosshatch)] {
+            match p.get(key) {
+                None | Some(Value::Null) => {}
+                Some(Value::Bool(b)) => *field = *b,
+                Some(_) => return Err(bad(SET, format!("{key} must be true or false"))),
+            }
         }
+        v.interval_mm = f64_or(p, "interval", v.interval_mm);
+        v.angle_deg = f64_or(p, "angle", v.angle_deg);
+        v.overscan_mm = f64_or(p, "overscan", v.overscan_mm);
         if let Some(m) = str_param(p, "mode") {
-            v.mode = LaserMode::parse(m).ok_or_else(|| bad(SET, format!("mode `{m}`: only line is available")))?;
+            v.mode = LaserMode::parse(m).ok_or_else(|| bad(SET, format!("mode `{m}`: line or fill")))?;
         }
         v.validate().map_err(|e| bad(SET, e))?;
         Some(v)
@@ -314,7 +330,7 @@ mod tests {
         assert!(s.execute(SET, &json!({"layer": l, "power": 120})).is_err());
         assert!(s.execute(SET, &json!({"layer": l, "speed": 0})).is_err());
         assert!(s.execute(SET, &json!({"layer": l, "passes": 0})).is_err());
-        assert!(s.execute(SET, &json!({"layer": l, "mode": "fill"})).is_err());
+        assert!(s.execute(SET, &json!({"layer": l, "mode": "raster"})).is_err());
         assert!(s.execute(SET, &json!({"layer": 999_999})).is_err());
         let rect = s.doc().unwrap().doc.layers[0].children().unwrap()[0].id.0;
         assert!(s.execute(SET, &json!({"layer": rect, "power": 10})).is_err());
@@ -345,6 +361,36 @@ mod tests {
         })
         .unwrap();
         assert!(export(&mut s, json!({})).is_err());
+    }
+
+    #[test]
+    fn fill_layers_engrave_scan_lines() {
+        let mut s = session();
+        s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap();
+        let l = layer(&s);
+        let r = s
+            .execute(
+                SET,
+                &json!({"layer": l, "mode": "fill", "interval": 1, "angle": 90, "bidirectional": false, "overscan": 2, "crosshatch": false}),
+            )
+            .unwrap();
+        assert_eq!(
+            (r["mode"].as_str(), r["interval"].as_f64(), r["angle"].as_f64(), r["overscan"].as_f64()),
+            (Some("fill"), Some(1.0), Some(90.0), Some(2.0))
+        );
+        assert_eq!(r["bidirectional"], false);
+        let listed = s.execute("laser.layers", &json!({})).unwrap();
+        assert_eq!(listed["layers"][0]["mode"], "fill");
+        let g = export(&mut s, json!({})).unwrap();
+        // 25 vertical lines (1 mm apart across 25.4 mm), each with run-in and run-out at S0.
+        assert_eq!(g["contours"], 25);
+        let text = g["gcode"].as_str().unwrap();
+        assert!(text.contains("M4 S0"), "overscan at power 0");
+        for bad in [json!({"interval": 0}), json!({"overscan": 60}), json!({"angle": "steep"}), json!({"crosshatch": "yes"})] {
+            let mut p = bad.clone();
+            p["layer"] = json!(l);
+            assert!(s.execute(SET, &p).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -68,3 +68,15 @@ it was refused (art off the bed). **Document layers** lists the document's layer
 (`laser.layers`) and sets their speed, power, passes and on/off with `laser.setLayer` (one undoable
 step each). The dry run draws the bed with the machine's origin corner. The pasted-SVG section is
 kept as legacy: it ignores the origin.
+
+### Fill mode
+
+A layer in **Fill** mode (`laser.setLayer {mode: fill, interval, angle, bidirectional, overscan,
+crosshatch}`, or the panel's layer table) engraves the inside of its closed shapes with parallel
+scan lines instead of cutting their outlines. Each shape's fill rule (nonzero or even-odd) decides
+what is inside, so holes stay empty, and overlapping shapes are burnt once per line. `interval` is
+the line spacing (0.01–10 mm), `angle` turns the lines (0° horizontal, 90° vertical),
+`bidirectional` runs every other line back, `crosshatch` fills again at right angles, and
+`overscan` (0–50 mm) runs the head on past each end of a line at power 0 (S0) so it burns at
+speed; overscan is shortened where it would leave the bed, with a warning. The dry run shows the
+overscan as travel.

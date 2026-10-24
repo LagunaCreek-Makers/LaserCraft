@@ -10,7 +10,10 @@ use vectorcraft_color::Paint;
 use vectorcraft_doc::{Document, Node, NodeId, NodeKind};
 use vectorcraft_geom::{Affine, BezPath, Point};
 
-use crate::settings::LayerSettings;
+use vectorcraft_geom::FillRule;
+
+use crate::fill::Shape;
+use crate::settings::{LaserMode, LayerSettings};
 
 /// Symbols inside symbols are followed this deep.
 const MAX_NEST: u32 = 16;
@@ -31,10 +34,16 @@ pub(crate) struct Contour {
     pub closed: bool,
 }
 
-/// What the walk found: the contours of each settings layer, in paint order.
+/// One settings layer's art: polylines to cut (Line mode) or shapes to fill (Fill mode).
+pub(crate) struct WalkedLayer {
+    pub settings: LayerSettings,
+    pub contours: Vec<Contour>,
+    pub shapes: Vec<Shape>,
+}
+
+/// What the walk found: the art of each settings layer, in paint order.
 pub(crate) struct Walked {
-    /// (layer id, its settings, its contours).
-    pub layers: Vec<(NodeId, LayerSettings, Vec<Contour>)>,
+    pub layers: Vec<WalkedLayer>,
     pub warnings: Vec<String>,
 }
 
@@ -82,7 +91,7 @@ impl<'a> Walker<'a> {
         for l in &doc.layers {
             self.node(l, self.only.is_none());
         }
-        self.out.layers.retain(|(_, s, c)| s.enabled && !c.is_empty());
+        self.out.layers.retain(|l| l.settings.enabled && !(l.contours.is_empty() && l.shapes.is_empty()));
         self.out
     }
 
@@ -106,27 +115,27 @@ impl<'a> Walker<'a> {
                 // with its parent layer's (the defaults at the top).
                 if self.current.is_none() || self.settings.contains_key(&n.id) {
                     let s = self.settings.get(&n.id).copied().unwrap_or(self.default);
-                    self.out.layers.push((n.id, s, vec![]));
+                    self.out.layers.push(WalkedLayer { settings: s, contours: vec![], shapes: vec![] });
                     self.current = Some(self.out.layers.len() - 1);
                 }
                 self.children(children, *clip, chosen);
                 self.current = outer;
             }
             NodeKind::Group { children, clip } => self.children(children, *clip, chosen),
-            NodeKind::Path { path, guide, clipping, .. } => {
+            NodeKind::Path { path, guide, clipping, rule, .. } => {
                 if chosen && !*guide && !*clipping {
                     self.note_paint(n);
-                    self.cut(&path.to_bezpath());
+                    self.cut(&path.to_bezpath(), *rule);
                 }
             }
-            NodeKind::Compound { children, .. } => {
+            NodeKind::Compound { children, rule } => {
                 if chosen {
                     self.note_paint(n);
                     let mut bp = BezPath::new();
                     for p in children.iter().filter_map(|c| c.path_data()) {
                         bp.extend(p.to_bezpath());
                     }
-                    self.cut(&bp);
+                    self.cut(&bp, *rule);
                 }
             }
             NodeKind::Text(_) => {
@@ -192,8 +201,9 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// `bp` (document space) flattened into polylines in millimetres, added to the current layer.
-    fn cut(&mut self, bp: &BezPath) {
+    /// `bp` (document space) flattened into polylines in millimetres, added to the current layer:
+    /// as lines to cut, or in a Fill layer as a shape filled by `rule`.
+    fn cut(&mut self, bp: &BezPath, rule: FillRule) {
         let Some(layer) = self.current else { return };
         let mm = self.to_mm * bp.clone();
         let mut contours: Vec<Contour> = vec![];
@@ -228,8 +238,12 @@ impl<'a> Walker<'a> {
             return;
         }
         self.points += n;
-        if let Some((_, _, list)) = self.out.layers.get_mut(layer) {
-            list.extend(contours);
+        if let Some(l) = self.out.layers.get_mut(layer) {
+            match l.settings.mode {
+                LaserMode::Line => l.contours.extend(contours),
+                // A fill closes every outline.
+                LaserMode::Fill => l.shapes.push(Shape { polys: contours.into_iter().map(|c| c.points).collect(), rule }),
+            }
         }
     }
 }
