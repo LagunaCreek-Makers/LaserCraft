@@ -75,16 +75,55 @@ fn rectangle_in_millimetres_with_y_up_from_the_bottom_left() {
 }
 
 #[test]
-fn top_left_origin_keeps_y_down() {
+fn each_origin_corner_counts_from_its_corner_of_the_artboard() {
     let mut d = doc();
-    let r = path(&mut d, shapes::rectangle(Rect::new(72.0, 72.0, 144.0, 144.0)));
+    // 1 in from the left and 2 in from the top, 1 in wide and 0.5 in tall, on a 10 in board.
+    let r = path(&mut d, shapes::rectangle(Rect::new(72.0, 144.0, 144.0, 180.0)));
     add(&mut d, r);
-    let j = document_to_job(&d, &JobOptions { origin: Origin::TopLeft, ..JobOptions::default() }).unwrap();
-    let ys: Vec<f64> = polylines(&j)[0].iter().map(|p| p.1).collect();
-    assert!(ys.iter().all(|y| close(*y, 25.4) || close(*y, 50.8)), "{ys:?}");
+    let span = |o: Origin| {
+        let l = &polylines(&document_to_job(&d, &JobOptions { origin: o, ..JobOptions::default() }).unwrap())[0];
+        let xs: Vec<f64> = l.iter().map(|p| p.0).collect();
+        let ys: Vec<f64> = l.iter().map(|p| p.1).collect();
+        let min = |v: &[f64]| v.iter().copied().fold(f64::MAX, f64::min) / 25.4;
+        let max = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max) / 25.4;
+        [min(&xs), max(&xs), min(&ys), max(&ys)]
+    };
+    let near = |a: [f64; 4], b: [f64; 4]| a.iter().zip(b).all(|(a, b)| close(*a, b));
+    // Inches from the origin corner: x then y.
+    assert!(near(span(Origin::BottomLeft), [1.0, 2.0, 7.5, 8.0]), "{:?}", span(Origin::BottomLeft));
+    assert!(near(span(Origin::TopLeft), [1.0, 2.0, 2.0, 2.5]), "{:?}", span(Origin::TopLeft));
+    assert!(near(span(Origin::TopRight), [8.0, 9.0, 2.0, 2.5]), "{:?}", span(Origin::TopRight));
+    assert!(near(span(Origin::BottomRight), [8.0, 9.0, 7.5, 8.0]), "{:?}", span(Origin::BottomRight));
+    for o in Origin::ALL {
+        assert_eq!(Origin::parse(o.id()), Some(o));
+    }
     assert_eq!(Origin::parse("top-left"), Some(Origin::TopLeft));
-    assert_eq!(Origin::parse("bottomLeft"), Some(Origin::BottomLeft));
+    assert_eq!(Origin::parse("back right"), Some(Origin::TopRight));
     assert_eq!(Origin::parse("middle"), None);
+}
+
+#[test]
+fn machine_profiles_give_the_bed_and_origin() {
+    let profiles = serde_json::json!({
+        "schema_version": 1,
+        "machines": [
+            // Saved before profiles had an origin: the controller's usual corner.
+            {"name": "GRBL 300 x 200", "controller": "GRBL", "width_mm": 300.0, "height_mm": 200.0, "max_s": 1000, "port": "", "baud": 115200},
+            {"name": "Shop CO2", "controller": "Ruida", "width_mm": 600.0, "height_mm": 400.0},
+            {"name": "Diode", "controller": "GRBL", "width_mm": 400.0, "height_mm": 400.0, "max_s": 255, "origin": "topLeft"},
+            {"name": "Broken", "width_mm": -5.0, "height_mm": 400.0}
+        ]
+    });
+    let all = machines(&profiles);
+    assert_eq!(all.len(), 3, "the broken one is left out");
+    let grbl = find_machine(&profiles, "grbl 300 x 200").unwrap();
+    assert_eq!((grbl.width_mm, grbl.height_mm, grbl.max_s, grbl.origin), (300.0, 200.0, 1000, Origin::BottomLeft));
+    let co2 = find_machine(&profiles, "Shop CO2").unwrap();
+    assert_eq!((co2.max_s, co2.origin), (1000, Origin::TopRight));
+    assert_eq!(find_machine(&profiles, "Diode").unwrap().origin, Origin::TopLeft);
+    assert!(find_machine(&profiles, "Broken").unwrap_err().contains("width_mm"));
+    assert!(find_machine(&profiles, "Nope").unwrap_err().contains("Shop CO2"));
+    assert!(machines(&serde_json::json!({})).is_empty());
 }
 
 #[test]

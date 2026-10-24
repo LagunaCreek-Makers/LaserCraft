@@ -23,6 +23,8 @@ vectorcraft-svg = { workspace = true }
 vectorcraft-mcp = { workspace = true }
 vectorcraft-render = { workspace = true }
 vectorcraft-text = { workspace = true }
+# `run --machine`: the bed, power range and origin of a LaserCraft machine profile.
+lasercraft-cam = { path = "../../crates/laser-cam" }
 serde_json = { workspace = true }
 log = { workspace = true }
 

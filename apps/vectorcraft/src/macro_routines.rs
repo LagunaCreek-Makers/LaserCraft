@@ -97,10 +97,8 @@ impl RoutineDatabase {
     fn validate_calls(&self, steps: &[Step]) -> Result<(), String> {
         for s in steps {
             match s {
-                Step::Call { routine } => {
-                    if !self.routines.iter().any(|r| &r.name == routine) {
-                        return Err(format!("Unknown routine: {routine}"));
-                    }
+                Step::Call { routine } if !self.routines.iter().any(|r| &r.name == routine) => {
+                    return Err(format!("Unknown routine: {routine}"));
                 }
                 Step::If { then_steps, else_steps, .. } => {
                     self.validate_calls(then_steps)?;

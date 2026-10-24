@@ -2,11 +2,12 @@
 //!
 //! Live effects are baked first ([`vectorcraft_effects::bake_document`]); then each visible,
 //! printable layer's paths are flattened to polylines within a tolerance, converted from points to
-//! millimetres and placed on the bed from the chosen origin (y up from the artboard's bottom-left
-//! corner, or down from its top-left). Each layer is cut with its [`LayerSettings`], layers in
+//! millimetres and placed on the bed from the machine's origin corner ([`Origin`]: each axis runs
+//! from that corner of the artboard into it). Each layer is cut with its [`LayerSettings`], layers in
 //! paint order (bottom first), inner contours before the outlines around them and otherwise
 //! nearest first. Nothing here talks to a machine.
 
+pub mod machine;
 mod order;
 pub mod settings;
 mod walk;
@@ -20,39 +21,13 @@ use lasercraft_core::{Job, Operation, Point as MmPoint};
 use vectorcraft_doc::{Document, NodeId};
 use vectorcraft_geom::{Affine, Point, Rect};
 
+pub use machine::{MachineProfile, Origin, default_profiles_path, find_machine, machines};
 pub use settings::{LAYER_SETTINGS_KEY, LaserMode, LayerSettings, layer_settings, set_layer_settings};
 
 /// Millimetres per point.
 pub const MM_PER_PT: f64 = 25.4 / 72.0;
 /// The finest and coarsest flattening tolerance (mm).
 pub const TOLERANCE_RANGE: std::ops::RangeInclusive<f64> = 0.001..=5.0;
-
-/// Where the bed's origin sits on the artboard.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Origin {
-    /// x right and y up from the artboard's bottom-left corner (GRBL's usual front-left home).
-    #[default]
-    BottomLeft,
-    /// x right and y down from the artboard's top-left corner (machines homing at the back-left
-    /// whose y grows towards the front).
-    TopLeft,
-}
-
-impl Origin {
-    pub fn id(self) -> &'static str {
-        match self {
-            Origin::BottomLeft => "bottomLeft",
-            Origin::TopLeft => "topLeft",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
-            "bottomleft" | "bl" => Some(Origin::BottomLeft),
-            "topleft" | "tl" => Some(Origin::TopLeft),
-            _ => None,
-        }
-    }
-}
 
 /// How a document becomes a job.
 #[derive(Clone, Debug)]
@@ -89,10 +64,11 @@ pub struct JobOutput {
 /// The transform from document space (points, y down) to bed millimetres for `origin` on `frame`.
 pub fn bed_transform(frame: Rect, origin: Origin) -> Affine {
     let k = MM_PER_PT;
-    match origin {
-        Origin::BottomLeft => Affine::new([k, 0.0, 0.0, -k, -frame.x0 * k, frame.y1 * k]),
-        Origin::TopLeft => Affine::new([k, 0.0, 0.0, k, -frame.x0 * k, -frame.y0 * k]),
-    }
+    // x from the left edge rightwards or the right edge leftwards; y from the bottom edge up or
+    // the top edge down.
+    let (sx, tx) = if origin.right() { (-k, frame.x1 * k) } else { (k, -frame.x0 * k) };
+    let (sy, ty) = if origin.top() { (k, -frame.y0 * k) } else { (-k, frame.y1 * k) };
+    Affine::new([sx, 0.0, 0.0, sy, tx, ty])
 }
 
 /// `doc` as a laser job with `o`.

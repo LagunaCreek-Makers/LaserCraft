@@ -31,18 +31,24 @@ The original VectorCraft MIT/Apache license and NOTICE files remain included. Up
 `crates/laser-cam` (`lasercraft-cam`) turns a VectorCraft document into a `lasercraft_core::Job`:
 live effects baked, visible printable layers walked bottom first (hidden, template and
 non-printing layers, guides and hidden objects left out), curves flattened to a tolerance in mm,
-points converted to millimetres and placed from the artboard's bottom-left (y up) or top-left
-(y down) corner. Holes are cut before the outlines around them, then nearest first. Images, type
+points converted to millimetres and placed from the machine's origin corner (bottom-left,
+top-left, top-right or bottom-right of the artboard; each axis runs from that corner into the bed). Holes are cut before the outlines around them, then nearest first. Images, type
 (outline it first), gradients and clipping masks are reported as warnings.
 
 Per-layer settings (mode Line, speed mm/min, power %, passes, enabled) live in
 `Document.unknown["laserLayers"]`, keyed by layer id, so they save in `.vectorcraft` files and old
 files open unchanged.
 
-Engine commands: `laser.export_gcode {path?, origin?, selectionOnly?, tolerance?, artboard?,
-bedWidth?, bedHeight?, maxS?}`, `laser.setLayer {layer, speed?, power?, passes?, enabled?, mode?,
-clear?}` and `laser.layers`. From the command line:
+Machine profiles (the laser panel's `lasercraft/profiles.json`) give the bed size, maximum S and
+the origin corner. `origin` is a new, optional profile field (`bottomLeft`, `topLeft`, `topRight`,
+`bottomRight`), chosen in the panel's Machine profile section. Profiles saved before it get their
+controller's usual corner: top right for Ruida, bottom left for GRBL and the rest.
+
+Engine commands: `laser.exportGcode {bedWidth, bedHeight, origin?, maxS?, path?, selectionOnly?,
+tolerance?, artboard?}` (the bed is required: there is no default size), `laser.setLayer {layer,
+speed?, power?, passes?, enabled?, mode?, clear?}` and `laser.layers`. Passes repeat the whole
+layer. From the command line, `--machine` reads a profile:
 
 ```bash
-vectorcraft-cli run --in part.vectorcraft --cmd laser.export_gcode --params '{"path": "part.gcode", "bedWidth": 300, "bedHeight": 200}'
+vectorcraft-cli run --in part.vectorcraft --machine "GRBL 300 x 200" --cmd laser.exportGcode --params '{"path": "part.gcode"}'
 ```

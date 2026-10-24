@@ -11,6 +11,7 @@ use crate::macro_routines::{Context, EventBinding, Routine, RoutineDatabase, Ste
 use crate::ruida_monitor;
 use crate::ruida_protocol;
 use egui::{self, Color32};
+use lasercraft_cam::Origin;
 use lasercraft_core::{Job, Machine, Operation, Point};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -65,6 +66,8 @@ pub struct LaserPanel {
     machine_width: f64,
     machine_height: f64,
     max_s: u32,
+    /// The corner the machine counts from (saved in its profile as `origin`).
+    machine_origin: Origin,
     message: String,
     svg_source: String,
     generated_gcode: String,
@@ -130,6 +133,7 @@ impl Default for LaserPanel {
             machine_width: 300.0,
             machine_height: 200.0,
             max_s: 1000,
+            machine_origin: Origin::BottomLeft,
             message: "Offline mode — no laser is connected".into(),
             svg_source: String::new(),
             generated_gcode: String::new(),
@@ -191,14 +195,7 @@ impl Default for LaserPanel {
 }
 impl LaserPanel {
     fn settings_path() -> Option<PathBuf> {
-        let root = if cfg!(target_os = "windows") {
-            std::env::var_os("APPDATA").map(PathBuf::from)
-        } else if cfg!(target_os = "macos") {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
-        } else {
-            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        }?;
-        Some(root.join("lasercraft").join("profiles.json"))
+        lasercraft_cam::default_profiles_path()
     }
     fn load_profiles(mut self) -> Self {
         if let Some(path) = Self::settings_path()
@@ -243,6 +240,8 @@ impl LaserPanel {
             self.machine_height = p["height_mm"].as_f64().unwrap_or(200.0).clamp(1.0, 10000.0);
             self.max_s = p["max_s"].as_u64().unwrap_or(1000).clamp(1, 100000) as u32;
             self.controller = p["controller"].as_str().unwrap_or("GRBL").to_owned();
+            // Profiles saved before `origin` existed get their controller's usual corner.
+            self.machine_origin = p["origin"].as_str().and_then(Origin::parse).unwrap_or_else(|| Origin::default_for(&self.controller));
             self.connection_port = p["port"].as_str().unwrap_or("").to_owned();
             self.connection_baud = p["baud"].as_u64().unwrap_or(115200).clamp(1200, 1000000) as u32;
             self.air_config = serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
@@ -431,7 +430,7 @@ impl LaserPanel {
     ui.horizontal(|ui|{ui.label("Port / address");ui.text_edit_singleline(&mut self.connection_port);});
     ui.horizontal(|ui|{ui.label("Baud (GRBL)");ui.add(egui::DragValue::new(&mut self.connection_baud).range(1200..=1000000));});
     if ui.button("Save current machine as new profile").clicked(){
-     self.profiles.push(json!({"name":format!("{} machine {}",self.controller,self.profiles.len()+1),"controller":self.controller,"width_mm":self.machine_width,"height_mm":self.machine_height,"max_s":self.max_s,"port":self.connection_port,"baud":self.connection_baud,"air_assist":self.air_config,"accessories":self.accessory_config}));
+     self.profiles.push(json!({"name":format!("{} machine {}",self.controller,self.profiles.len()+1),"controller":self.controller,"width_mm":self.machine_width,"height_mm":self.machine_height,"max_s":self.max_s,"origin":self.machine_origin.id(),"port":self.connection_port,"baud":self.connection_baud,"air_assist":self.air_config,"accessories":self.accessory_config}));
      self.active_profile=self.profiles.len()-1;
      self.message=match self.save_profiles(){Ok(())=>"Machine profile saved".into(),Err(e)=>format!("Save failed: {e}")};
     }
@@ -864,6 +863,19 @@ impl LaserPanel {
     ui.horizontal(|ui|{ui.label("Bed width (mm)");ui.add(egui::DragValue::new(&mut self.machine_width).range(1.0..=10000.0));});
     ui.horizontal(|ui|{ui.label("Bed height (mm)");ui.add(egui::DragValue::new(&mut self.machine_height).range(1.0..=10000.0));});
     ui.horizontal(|ui|{ui.label("GRBL maximum S");ui.add(egui::DragValue::new(&mut self.max_s).range(1..=100000));});
+    ui.horizontal(|ui|{
+     ui.label("Origin");
+     egui::ComboBox::from_id_salt("lasercraft_machine_origin").selected_text(self.machine_origin.label()).show_ui(ui,|ui|{
+      for o in Origin::ALL{ui.selectable_value(&mut self.machine_origin,o,o.label());}
+     });
+    });
+    ui.small("The corner the machine homes to and counts from; G-code from the document is placed from that corner of the artboard.");
+    if ui.button("Save to selected machine").clicked(){
+     if let Some(p)=self.profiles.get_mut(self.active_profile){
+      p["width_mm"]=json!(self.machine_width);p["height_mm"]=json!(self.machine_height);p["max_s"]=json!(self.max_s);p["origin"]=json!(self.machine_origin.id());
+      self.message=match self.save_profiles(){Ok(())=>"Machine profile saved".into(),Err(e)=>format!("Save failed: {e}")};
+     } else {self.message="Select a machine first".into();}
+    }
    });
    ui.separator();
    ui.collapsing("SVG artwork → laser toolpaths (offline)",|ui|{

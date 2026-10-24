@@ -4617,6 +4617,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "lasercraft-cam",
  "lasercraft-core",
  "log",
  "muda",
@@ -4689,6 +4690,7 @@ dependencies = [
 name = "vectorcraft-cli"
 version = "0.13.1"
 dependencies = [
+ "lasercraft-cam",
  "log",
  "objc2-core-foundation",
  "objc2-core-text",

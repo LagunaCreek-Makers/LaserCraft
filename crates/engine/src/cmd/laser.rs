@@ -1,31 +1,29 @@
-//! LaserCraft: laser jobs made from the document (`lasercraft_cam`). `laser.export_gcode` writes
+//! LaserCraft: laser jobs made from the document (`lasercraft_cam`). `laser.exportGcode` writes
 //! GRBL G-code for review (nothing is sent to a machine); `laser.setLayer` and `laser.layers` set
 //! and read the per-layer cut settings, which save with the document.
 
+use lasercraft_cam::machine::MAX_BED_MM;
 use lasercraft_cam::{JobOptions, LaserMode, LayerSettings, Origin};
 use lasercraft_core::{Machine, PlanError};
 use serde_json::{Value, json};
 
 use super::*;
 
-const EXPORT: &str = "laser.export_gcode";
+const EXPORT: &str = "laser.exportGcode";
 const SET: &str = "laser.setLayer";
 
-/// The bed the job must fit when no size is given (mm).
-const DEFAULT_BED_MM: f64 = 400.0;
-/// The largest bed side (mm).
-const MAX_BED_MM: f64 = 10_000.0;
+const NO_BED: &str = "no machine bed size: select a machine profile or pass bedWidth/bedHeight";
 /// The spindle value full power is (GRBL's `$30`).
 const DEFAULT_MAX_S: u64 = 1000;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
-            "laser.export_gcode",
+            "laser.exportGcode",
             "Export Laser G-code",
             [],
             None,
-            "{path?, origin?: bottomLeft (default: x right, y up from the artboard's bottom-left corner)|topLeft (y down from its top-left), selectionOnly?: false, tolerance?: 0.05 (mm curves are flattened to, 0.001 to 5), artboard?: 0 (whose corner is the origin), bedWidth?: 400, bedHeight?: 400 (mm; art outside the bed is refused), maxS?: 1000 (GRBL $30: the S value of 100 % power)} → {gcode, warnings, contours, operations, path?, bytes?}. GRBL laser-mode G-code (M4 dynamic power, $32=1) of the visible, printable layers' paths, each layer cut with its laser.setLayer settings (bottom layer first, holes before the outlines around them, then nearest first). Review it before running it: nothing is sent to a machine",
+            "{bedWidth, bedHeight (mm, from the machine profile; art outside the bed is refused), origin?: the machine's corner: bottomLeft (default: x right, y up)|topLeft (x right, y down)|topRight (x left, y down)|bottomRight (x left, y up), maxS?: 1000 (GRBL $30: the S value of 100 % power), path?, selectionOnly?: false, tolerance?: 0.05 (mm curves are flattened to, 0.001 to 5), artboard?: 0 (the bed: the origin is its corner)} → {gcode, warnings, contours, operations, path?, bytes?}. GRBL laser-mode G-code (M4 dynamic power, $32=1) of the visible, printable layers' paths, each layer cut with its laser.setLayer settings (bottom layer first, holes before the outlines around them, then nearest first). Review it before running it: nothing is sent to a machine",
             has_doc,
             export_gcode
         ),
@@ -58,7 +56,7 @@ fn plan_error(e: PlanError) -> String {
 }
 
 fn bed_side(p: &Value, key: &str) -> Result<f64> {
-    let v = f64_or(p, key, DEFAULT_BED_MM);
+    let v = p.get(key).and_then(Value::as_f64).ok_or_else(|| bad(EXPORT, NO_BED))?;
     if !(v.is_finite() && v > 0.0 && v <= MAX_BED_MM) {
         return Err(bad(EXPORT, format!("{key} must be more than 0 and at most {MAX_BED_MM} mm, not {v}")));
     }
@@ -72,7 +70,7 @@ fn export_gcode(s: &mut Session, p: &Value) -> Result<Value> {
     check_numbers(p, &["tolerance", "artboard", "bedWidth", "bedHeight", "maxS"], EXPORT)?;
     let origin = match str_param(p, "origin") {
         None => Origin::BottomLeft,
-        Some(o) => Origin::parse(o).ok_or_else(|| bad(EXPORT, format!("origin `{o}`: bottomLeft or topLeft")))?,
+        Some(o) => Origin::parse(o).ok_or_else(|| bad(EXPORT, format!("origin `{o}`: bottomLeft, topLeft, topRight or bottomRight")))?,
     };
     let artboard = match p.get("artboard") {
         None | Some(Value::Null) => 0,
@@ -80,7 +78,10 @@ fn export_gcode(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let max_s = match p.get("maxS") {
         None | Some(Value::Null) => DEFAULT_MAX_S,
-        Some(v) => v.as_u64().filter(|n| (1..=1_000_000).contains(n)).ok_or_else(|| bad(EXPORT, "maxS must be a whole number from 1 to 1000000"))?,
+        Some(v) => v
+            .as_u64()
+            .filter(|n| (1..=u64::from(lasercraft_cam::machine::MAX_S)).contains(n))
+            .ok_or_else(|| bad(EXPORT, format!("maxS must be a whole number from 1 to {}", lasercraft_cam::machine::MAX_S)))?,
     };
     let machine = Machine { width_mm: bed_side(p, "bedWidth")?, height_mm: bed_side(p, "bedHeight")?, max_s: u32::try_from(max_s).unwrap_or(1000) };
     let selection = if bool_or(p, "selectionOnly", false) {
@@ -196,6 +197,16 @@ mod tests {
         s
     }
 
+    /// `laser.exportGcode` with `p`, on a 300 × 300 mm bed unless `p` gives one.
+    fn export(s: &mut Session, mut p: Value) -> Result<Value> {
+        for key in ["bedWidth", "bedHeight"] {
+            if p.get(key).is_none() {
+                p[key] = json!(300);
+            }
+        }
+        s.execute(EXPORT, &p)
+    }
+
     fn layer(s: &Session) -> u64 {
         s.doc().unwrap().doc.layers[0].id.0
     }
@@ -205,7 +216,7 @@ mod tests {
         let mut s = session();
         s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap();
         s.execute("shape.ellipse", &json!({"x": 288, "y": 288, "width": 144, "height": 144})).unwrap();
-        let r = s.execute(EXPORT, &json!({})).unwrap();
+        let r = export(&mut s, json!({})).unwrap();
         let g = r["gcode"].as_str().unwrap();
         assert!(g.starts_with("G21\nG90\nM5\n"), "{g}");
         assert!(g.contains("M4 S200"), "default power 20 %");
@@ -214,12 +225,16 @@ mod tests {
         assert!(g.contains("X25.400 Y203.200") || g.contains("X50.800 Y203.200"), "{g}");
         assert_eq!(r["contours"], 2);
         assert!(r["warnings"].as_array().unwrap().is_empty());
-        // Top-left origin keeps y down.
-        let t = s.execute(EXPORT, &json!({"origin": "topLeft"})).unwrap();
+        // Each corner of the bed counts from its own corner of the artboard.
+        let t = export(&mut s, json!({"origin": "topLeft"})).unwrap();
         assert!(t["gcode"].as_str().unwrap().contains("Y25.400"));
-        assert!(s.execute(EXPORT, &json!({"origin": "centre"})).is_err());
-        assert!(s.execute(EXPORT, &json!({"tolerance": "fine"})).is_err());
-        assert!(s.execute(EXPORT, &json!({"tolerance": 0})).is_err());
+        let t = export(&mut s, json!({"origin": "topRight"})).unwrap();
+        assert!(t["gcode"].as_str().unwrap().contains("X203.200 Y25.400") || t["gcode"].as_str().unwrap().contains("X228.600 Y25.400"));
+        let t = export(&mut s, json!({"origin": "bottomRight"})).unwrap();
+        assert!(t["gcode"].as_str().unwrap().contains(" Y203.200"));
+        assert!(export(&mut s, json!({"origin": "centre"})).is_err());
+        assert!(export(&mut s, json!({"tolerance": "fine"})).is_err());
+        assert!(export(&mut s, json!({"tolerance": 0})).is_err());
     }
 
     #[test]
@@ -232,7 +247,7 @@ mod tests {
             (r["speed"].as_f64(), r["power"].as_f64(), r["passes"].as_u64(), r["enabled"].as_bool()),
             (Some(600.0), Some(75.0), Some(2), Some(true))
         );
-        let g = s.execute(EXPORT, &json!({})).unwrap();
+        let g = export(&mut s, json!({})).unwrap();
         assert_eq!(g["contours"], 2);
         assert!(g["gcode"].as_str().unwrap().contains("M4 S750"));
         assert!(g["gcode"].as_str().unwrap().contains("F600.0"));
@@ -256,7 +271,7 @@ mod tests {
         assert!(s.execute(SET, &json!({"layer": rect, "power": 10})).is_err());
         // Disabled: nothing to cut.
         s.execute(SET, &json!({"layer": l, "enabled": false})).unwrap();
-        assert!(s.execute(EXPORT, &json!({})).is_err());
+        assert!(export(&mut s, json!({})).is_err());
         // Clear: back to the defaults.
         let r = s.execute(SET, &json!({"layer": l, "clear": true})).unwrap();
         assert_eq!(r["power"], 20.0);
@@ -268,11 +283,11 @@ mod tests {
         let mut s = session();
         let a = s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap()["id"].clone();
         s.execute("shape.rectangle", &json!({"x": 300, "y": 300, "width": 72, "height": 72})).unwrap();
-        assert_eq!(s.execute(EXPORT, &json!({})).unwrap()["contours"], 2);
+        assert_eq!(export(&mut s, json!({})).unwrap()["contours"], 2);
         s.execute("select.set", &json!({"ids": [a]})).unwrap();
-        assert_eq!(s.execute(EXPORT, &json!({"selectionOnly": true})).unwrap()["contours"], 1);
+        assert_eq!(export(&mut s, json!({"selectionOnly": true})).unwrap()["contours"], 1);
         s.execute("select.none", &json!({})).unwrap();
-        assert!(s.execute(EXPORT, &json!({"selectionOnly": true})).is_err());
+        assert!(export(&mut s, json!({"selectionOnly": true})).is_err());
         // Hiding the layer leaves nothing.
         let l = layer(&s);
         s.edit("hide", |d, _| {
@@ -280,18 +295,22 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(s.execute(EXPORT, &json!({})).is_err());
+        assert!(export(&mut s, json!({})).is_err());
     }
 
     #[test]
     fn art_off_the_bed_is_refused() {
         let mut s = session();
         s.execute("shape.rectangle", &json!({"x": 648, "y": 72, "width": 36, "height": 36})).unwrap();
-        let e = s.execute(EXPORT, &json!({"bedWidth": 200, "bedHeight": 300})).unwrap_err().to_string();
+        let e = export(&mut s, json!({"bedWidth": 200, "bedHeight": 300})).unwrap_err().to_string();
         assert!(e.contains("outside the bed"), "{e}");
-        assert!(s.execute(EXPORT, &json!({"bedWidth": 300, "bedHeight": 300})).is_ok());
-        assert!(s.execute(EXPORT, &json!({"bedWidth": -1})).is_err());
-        assert!(s.execute(EXPORT, &json!({"maxS": 0})).is_err());
+        assert!(export(&mut s, json!({"bedWidth": 300, "bedHeight": 300})).is_ok());
+        assert!(export(&mut s, json!({"bedWidth": -1})).is_err());
+        // The bed comes from the machine profile: no silent default.
+        let e = s.execute(EXPORT, &json!({})).unwrap_err().to_string();
+        assert!(e.contains("no machine bed size"), "{e}");
+        assert!(s.execute(EXPORT, &json!({"bedWidth": 300})).is_err());
+        assert!(export(&mut s, json!({"maxS": 0})).is_err());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -300,7 +319,7 @@ mod tests {
         let mut s = session();
         s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap();
         let path = std::env::temp_dir().join(format!("lasercraft-{}.gcode", std::process::id()));
-        let r = s.execute(EXPORT, &json!({"path": path.to_str().unwrap()})).unwrap();
+        let r = export(&mut s, json!({"path": path.to_str().unwrap()})).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(r["bytes"].as_u64(), Some(text.len() as u64));
         assert_eq!(r["gcode"].as_str(), Some(text.as_str()));
