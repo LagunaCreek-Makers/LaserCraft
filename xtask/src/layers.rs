@@ -63,6 +63,10 @@ pub const TABLE: &[(&str, Class)] = &[
     ("plugins", Class::Layer(2)),
     ("affinity", Class::Standalone),
     ("scriptcheck", Class::Standalone),
+    // LaserCraft: the laser planner (no workspace deps), the document-to-job CAM and its CLI.
+    ("lasercraft-core", Class::Standalone),
+    ("lasercraft-cam", Class::Layer(3)),
+    ("lasercraft-cli", Class::Exempt),
 ];
 
 /// Explicit orderings *within* a layer (earlier may be used by later).

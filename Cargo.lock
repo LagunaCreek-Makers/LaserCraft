@@ -2293,6 +2293,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lasercraft-cam"
+version = "0.13.1"
+dependencies = [
+ "kurbo 0.13.1",
+ "lasercraft-core",
+ "serde",
+ "serde_json",
+ "vectorcraft-color",
+ "vectorcraft-doc",
+ "vectorcraft-effects",
+ "vectorcraft-geom",
+]
+
+[[package]]
 name = "lasercraft-cli"
 version = "0.13.1"
 dependencies = [
@@ -4603,6 +4617,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "lasercraft-cam",
  "lasercraft-core",
  "log",
  "muda",
@@ -4675,6 +4690,7 @@ dependencies = [
 name = "vectorcraft-cli"
 version = "0.13.1"
 dependencies = [
+ "lasercraft-cam",
  "log",
  "objc2-core-foundation",
  "objc2-core-text",
@@ -4748,6 +4764,8 @@ dependencies = [
  "flate2",
  "image",
  "kurbo 0.13.1",
+ "lasercraft-cam",
+ "lasercraft-core",
  "log",
  "proptest",
  "roxmltree 0.21.1",

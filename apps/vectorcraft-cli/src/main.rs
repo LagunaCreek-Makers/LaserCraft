@@ -76,10 +76,15 @@ USAGE:
       DIR, links followed; a root left out grants none of its access. They imply --headless: a
       running app enforces its own (vectorcraft --control PORT --automation-read-root DIR …).
 
-  vectorcraft-cli run [--in FILE] [--cmd ID [--params JSON]]... [--export FILE]... [--scale N]
+  vectorcraft-cli run [--in FILE] [--cmd ID [--params JSON]]... [--export FILE]... [--scale N] [--machine NAME [--profiles FILE]]
       Headless batch: open FILE (any readable format) or start a new document, run commands in
       order, export each FILE in the format its extension picks (see Writable formats; a .ait FILE
       is a template, written as file.saveAsTemplate writes it). Prints one JSON result per step.
+      --machine NAME gives laser.exportGcode the bed size, maximum S and origin corner of that
+      LaserCraft machine profile (from FILE, default the laser panel's lasercraft/profiles.json in
+      the configuration folder); params given with --params win. Laser G-code from a saved file
+      (review it offline; nothing is sent to a machine):
+        vectorcraft-cli run --in FILE.vectorcraft --machine NAME --cmd laser.exportGcode --params '{\"path\": \"OUT.gcode\"}'
 
   vectorcraft-cli commands
       Print the command catalogue as JSON.
@@ -324,10 +329,31 @@ enum Step {
     Export(String),
 }
 
+/// The machine profile `name` of `file` (default the laser panel's `profiles.json`).
+fn machine_profile(name: &str, file: Option<&str>) -> Result<lasercraft_cam::MachineProfile, String> {
+    let path = match file {
+        Some(f) => std::path::PathBuf::from(f),
+        None => lasercraft_cam::default_profiles_path().ok_or("no configuration folder for LaserCraft machine profiles: pass --profiles FILE")?,
+    };
+    let bytes = std::fs::read(&path).map_err(|e| format!("machine profiles {}: {e}", path.display()))?;
+    let profiles: Value = serde_json::from_slice(&bytes).map_err(|e| format!("machine profiles {}: {e}", path.display()))?;
+    lasercraft_cam::find_machine(&profiles, name)
+}
+
+/// `params` with machine `m`'s bed, maximum S and origin where they don't give their own.
+fn with_machine(params: &mut Value, m: &lasercraft_cam::MachineProfile) {
+    let Some(o) = params.as_object_mut() else { return };
+    o.entry("bedWidth").or_insert(json!(m.width_mm));
+    o.entry("bedHeight").or_insert(json!(m.height_mm));
+    o.entry("maxS").or_insert(json!(m.max_s));
+    o.entry("origin").or_insert(json!(m.origin.id()));
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let mut input: Option<String> = None;
     let mut steps: Vec<Step> = vec![];
     let mut scale = 1.0;
+    let (mut machine, mut profiles): (Option<String>, Option<String>) = (None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = |what: &str| it.next().cloned().ok_or_else(|| format!("{a} needs {what}"));
@@ -350,8 +376,22 @@ fn run(args: &[String]) -> Result<(), String> {
                 let raw = val("a number")?;
                 scale = raw.parse::<f64>().map_err(|_| format!("--scale {raw}: not a number"))?;
             }
+            "--machine" | "-m" => machine = Some(val("a machine profile name")?),
+            "--profiles" => profiles = Some(val("a profiles.json file")?),
             other => return Err(format!("unknown run option `{other}`")),
         }
+    }
+    if let Some(name) = &machine {
+        let m = machine_profile(name, profiles.as_deref())?;
+        for step in &mut steps {
+            if let Step::Cmd(id, params) = step
+                && id == "laser.exportGcode"
+            {
+                with_machine(params, &m);
+            }
+        }
+    } else if profiles.is_some() {
+        return Err("--profiles needs --machine".into());
     }
 
     let mut h = with_stores(Headless::new());

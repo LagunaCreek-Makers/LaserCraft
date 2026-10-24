@@ -43,6 +43,7 @@ mod grbl_monitor;
 #[cfg(test)]
 mod grbl_simulator;
 mod grbl_stream;
+mod laser_doc;
 mod laser_panel;
 mod laser_sim;
 mod laser_tests;
@@ -97,6 +98,28 @@ struct App {
     window_frame: Option<window_frame::WindowFrameFn>,
 }
 
+impl App {
+    /// The LaserCraft windows: the laser panel (acting on the document through commands) and the
+    /// camera tools.
+    fn laser_windows(&mut self, ui: &mut egui::Ui) {
+        // The panel acts on the document through commands, as the person at the keyboard.
+        let app = &mut self.app;
+        self.laser_panel.show(ui.ctx(), &mut |id, params| file_access::unconfined(|| app.run(id, params)));
+        egui::Window::new("LaserCraft Camera Tools").default_pos(egui::pos2(10.0, 55.0)).show(ui.ctx(), |ui| {
+            if ui.button("Camera placement overlay").clicked() {
+                self.camera_overlay.open = true;
+            }
+        });
+        self.camera_overlay.show(
+            ui.ctx(),
+            self.laser_panel.camera_gcode(),
+            self.laser_panel.camera_bed_width(),
+            self.laser_panel.camera_bed_height(),
+            self.laser_panel.camera_max_s(),
+        );
+    }
+}
+
 impl eframe::App for App {
     // Each frame runs unconfined: it is the person at the keyboard's. The app confines what the
     // control channel asks for, and the frames carrying input it injected, to the automation roots
@@ -125,19 +148,14 @@ impl eframe::App for App {
             self.app.titlebar_inset = inset.unwrap_or(mac_window::DEFAULT_INSET);
         }
         file_access::unconfined(|| self.app.ui(ui));
-        self.laser_panel.show(ui.ctx());
-        egui::Window::new("LaserCraft Camera Tools").default_pos(egui::pos2(10.0, 55.0)).show(ui.ctx(), |ui| {
-            if ui.button("Camera placement overlay").clicked() {
-                self.camera_overlay.open = true;
-            }
-        });
-        self.camera_overlay.show(
-            ui.ctx(),
-            self.laser_panel.camera_gcode(),
-            self.laser_panel.camera_bed_width(),
-            self.laser_panel.camera_bed_height(),
-            self.laser_panel.camera_max_s(),
-        );
+        // The app binds its font families (window titles and headings use its semibold) as its
+        // first frame ends: until then drawing a LaserCraft window panics, so they wait a frame.
+        let semibold = egui::FontFamily::Name(vectorcraft_ui_egui::theme::FONT_UI_SEMIBOLD.into());
+        if ui.ctx().fonts(|f| f.definitions().families.contains_key(&semibold)) {
+            self.laser_windows(ui);
+        } else {
+            ui.ctx().request_repaint();
+        }
         // Preferences are written when confirmed, not only at exit: a session ended any other way
         // (the system shutting down, the process ended or crashing) used to lose them (#1747).
         if self.app.take_prefs_changed() {

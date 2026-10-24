@@ -461,3 +461,40 @@ fn runs_without_preferences_remember_nothing() {
     let r = run_in(&config, &[("pdf.preset.list", json!({}))]);
     assert!(r[0]["presets"].as_array().unwrap().iter().all(|p| p["builtIn"] == true));
 }
+
+/// `run --machine` gives laser.exportGcode the profile's bed and origin; without one the export
+/// asks for a bed.
+#[test]
+fn run_laser_export_with_a_machine_profile() {
+    let profiles = tmp("profiles.json");
+    std::fs::write(
+        &profiles,
+        json!({"machines": [{"name": "Small", "controller": "GRBL", "width_mm": 100.0, "height_mm": 100.0, "max_s": 255, "origin": "topRight"}, {"name": "Big", "width_mm": 300.0, "height_mm": 300.0}]}).to_string(),
+    )
+    .unwrap();
+    let gcode = tmp("part.gcode");
+    let run = |machine: &str, path: &std::path::Path| {
+        Command::new(BIN)
+            .args(["run", "--cmd", "file.new", "--params", r#"{"width":720,"height":720}"#])
+            .args(["--cmd", "shape.rectangle", "--params", r#"{"x":72,"y":72,"width":72,"height":72}"#])
+            .args(["--machine", machine, "--profiles", profiles.to_str().unwrap()])
+            .args(["--cmd", "laser.exportGcode", "--params", &json!({"path": path}).to_string()])
+            .output()
+            .unwrap()
+    };
+    // From the back-right corner of a 254 mm board, the part lies 203 mm in: off a 100 mm bed.
+    let out = run("Small", &gcode);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("outside the bed"), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run("big", &gcode);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&gcode).unwrap();
+    assert!(text.contains("M4 S200") && text.contains("Y203.200"), "bottom-left origin and S 1000 by default:\n{text}");
+    let out = run("Missing", &gcode);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Small, Big"));
+    let out = Command::new(BIN)
+        .args(["run", "--cmd", "shape.rectangle", "--params", r#"{"x":72,"y":72,"width":72,"height":72}"#, "--cmd", "laser.exportGcode"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no machine bed size"));
+}
