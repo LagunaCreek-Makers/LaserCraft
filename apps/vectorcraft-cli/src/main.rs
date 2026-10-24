@@ -80,6 +80,8 @@ USAGE:
       Headless batch: open FILE (any readable format) or start a new document, run commands in
       order, export each FILE in the format its extension picks (see Writable formats; a .ait FILE
       is a template, written as file.saveAsTemplate writes it). Prints one JSON result per step.
+      Laser G-code from a saved file (reviewed offline; nothing is sent to a machine):
+        vectorcraft-cli run --in FILE.vectorcraft --cmd laser.export_gcode --params '{\"path\": \"OUT.gcode\"}'
 
   vectorcraft-cli commands
       Print the command catalogue as JSON.

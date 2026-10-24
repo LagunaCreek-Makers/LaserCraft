@@ -18,10 +18,31 @@ cargo run -p lasercraft-cli -- rectangle 30 20 1200 25 300 200 > rectangle.gcode
 
 ## Engineering follow-up
 
-1. Expose document geometry through an adapter to `lasercraft-core`, including curves and transforms.
+1. ~~Expose document geometry through an adapter to `lasercraft-core`, including curves and transforms.~~ Done in M1 (see below).
 2. Add egui laser operation panel to `vectorcraft-ui-egui` and editor command routing.
 3. Implement GRBL serial streaming with response handling, stop/hold/resume, disconnect recovery and safety gates.
 4. Implement separately tested Ruida protocol with controller-specific profiles and transport.
 5. Add raster engraving, image processing, rotary transforms, camera calibration, simulation and material presets.
 
 The original VectorCraft MIT/Apache license and NOTICE files remain included. Upstream dependencies may require network access and Rust >=1.95 for compilation.
+
+## M1: laser jobs from the document
+
+`crates/laser-cam` (`lasercraft-cam`) turns a VectorCraft document into a `lasercraft_core::Job`:
+live effects baked, visible printable layers walked bottom first (hidden, template and
+non-printing layers, guides and hidden objects left out), curves flattened to a tolerance in mm,
+points converted to millimetres and placed from the artboard's bottom-left (y up) or top-left
+(y down) corner. Holes are cut before the outlines around them, then nearest first. Images, type
+(outline it first), gradients and clipping masks are reported as warnings.
+
+Per-layer settings (mode Line, speed mm/min, power %, passes, enabled) live in
+`Document.unknown["laserLayers"]`, keyed by layer id, so they save in `.vectorcraft` files and old
+files open unchanged.
+
+Engine commands: `laser.export_gcode {path?, origin?, selectionOnly?, tolerance?, artboard?,
+bedWidth?, bedHeight?, maxS?}`, `laser.setLayer {layer, speed?, power?, passes?, enabled?, mode?,
+clear?}` and `laser.layers`. From the command line:
+
+```bash
+vectorcraft-cli run --in part.vectorcraft --cmd laser.export_gcode --params '{"path": "part.gcode", "bedWidth": 300, "bedHeight": 200}'
+```

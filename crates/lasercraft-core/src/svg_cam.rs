@@ -83,7 +83,7 @@ pub fn svg_to_job(svg: &str, speed: f64, power: f64, passes: u32) -> Result<Job,
                 if nums.len() % 2 != 0 {
                     return Err(SvgCamError::Invalid("odd number of polygon coordinates".into()));
                 }
-                pts = nums.chunks_exact(2).map(|p| Point { x_mm: p[0], y_mm: p[1] }).collect();
+                pts = nums.as_chunks::<2>().0.iter().map(|&[x_mm, y_mm]| Point { x_mm, y_mm }).collect();
                 closed = tag == "polygon";
             }
             "path" => {

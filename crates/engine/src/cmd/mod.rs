@@ -36,6 +36,7 @@ pub mod importmatches;
 pub(crate) mod inline;
 mod interactivity;
 mod intertwine;
+mod laser;
 mod layer;
 mod layerpanel;
 pub mod library;
@@ -297,6 +298,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(perspgrid::specs());
         v.extend(shortcutset::specs());
         v.extend(importmatches::specs());
+        v.extend(laser::specs());
         v
     })
 }

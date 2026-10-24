@@ -1,0 +1,19 @@
+[package]
+name = "lasercraft-cam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LaserCraft CAM: turns a VectorCraft document into a controller-independent laser job"
+
+[lints]
+workspace = true
+
+[dependencies]
+vectorcraft-geom = { workspace = true }
+vectorcraft-color = { workspace = true }
+vectorcraft-doc = { workspace = true }
+vectorcraft-effects = { workspace = true }
+lasercraft-core = { path = "../lasercraft-core" }
+kurbo = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
