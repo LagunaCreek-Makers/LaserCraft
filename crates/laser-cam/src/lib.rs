@@ -7,6 +7,7 @@
 //! paint order (bottom first), inner contours before the outlines around them and otherwise
 //! nearest first. Nothing here talks to a machine.
 
+pub mod hooks;
 pub mod machine;
 mod order;
 pub mod settings;

@@ -469,7 +469,7 @@ fn run_laser_export_with_a_machine_profile() {
     let profiles = tmp("profiles.json");
     std::fs::write(
         &profiles,
-        json!({"machines": [{"name": "Small", "controller": "GRBL", "width_mm": 100.0, "height_mm": 100.0, "max_s": 255, "origin": "topRight"}, {"name": "Big", "width_mm": 300.0, "height_mm": 300.0}]}).to_string(),
+        json!({"machines": [{"name": "Small", "controller": "GRBL", "width_mm": 100.0, "height_mm": 100.0, "max_s": 255, "origin": "topRight"}, {"name": "Big", "width_mm": 300.0, "height_mm": 300.0, "air_assist": {"enabled": true, "on_command": "M8", "off_command": "M9", "default_on": true, "preflow_ms": 0, "postflow_ms": 0}}]}).to_string(),
     )
     .unwrap();
     let gcode = tmp("part.gcode");
@@ -490,6 +490,9 @@ fn run_laser_export_with_a_machine_profile() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = std::fs::read_to_string(&gcode).unwrap();
     assert!(text.contains("M4 S200") && text.contains("Y203.200"), "bottom-left origin and S 1000 by default:\n{text}");
+    // The machine's air assist wraps the job, as in the jobs the laser panel runs.
+    assert!(text.lines().position(|l| l == "M8") < text.lines().position(|l| l == "G21"), "{text}");
+    assert_eq!(text.lines().last(), Some("M9"), "{text}");
     let out = run("Missing", &gcode);
     assert!(String::from_utf8_lossy(&out.stderr).contains("Small, Big"));
     let out = Command::new(BIN)
