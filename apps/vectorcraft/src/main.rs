@@ -1,14 +1,3 @@
-mod macro_source_map;
-mod macro_debugger;
-mod macro_trace;
-mod macro_canvas;
-mod camera_validation;
-mod camera_lens;
-mod ruida_monitor;
-mod ruida_protocol;
-mod grbl_simulator;
-mod grbl_stream;
-mod grbl_monitor;
 //! VectorCraft desktop app.
 //!
 //! Usage: `vectorcraft [--control <port> [--automation-read-root <dir>] [--automation-write-root <dir>]]
@@ -33,7 +22,16 @@ compile_error!("windows7 requires --target x86_64-win7-windows-msvc; the ordinar
 #[cfg(all(target_vendor = "win7", not(feature = "windows7")))]
 compile_error!("the win7 target requires --no-default-features --features windows7");
 
+// LaserCraft modules.
+mod accessories;
+mod accessory_lifecycle;
+mod accessory_macros;
+mod air_assist;
 mod automation_args;
+mod camera_calibration;
+mod camera_lens;
+mod camera_overlay;
+mod camera_validation;
 mod clipboard;
 #[cfg(feature = "wgpu")]
 mod compositor_gpu;
@@ -41,17 +39,13 @@ mod control_server;
 mod cursor_theme;
 #[cfg(feature = "wgpu")]
 mod gpu;
-mod logging;
+mod grbl_monitor;
+mod grbl_simulator;
+mod grbl_stream;
 mod laser_panel;
 mod laser_sim;
 mod laser_tests;
-mod air_assist;
-mod accessories;
-mod accessory_lifecycle;
-mod accessory_macros;
-mod macro_routines;
-mod camera_overlay;
-mod camera_calibration;
+mod logging;
 #[cfg(target_os = "macos")]
 mod mac_fonts;
 #[cfg(target_os = "macos")]
@@ -62,12 +56,19 @@ mod mac_save_format;
 mod mac_screen_color;
 #[cfg(target_os = "macos")]
 mod mac_window;
+mod macro_canvas;
+mod macro_debugger;
+mod macro_routines;
+mod macro_source_map;
+mod macro_trace;
 #[cfg(target_os = "macos")]
 mod open_documents;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", test))]
 mod portal_save;
 mod prefs_dir;
 mod printing;
+mod ruida_monitor;
+mod ruida_protocol;
 #[cfg(all(windows, not(target_vendor = "win7")))]
 mod system_fonts;
 mod window;
@@ -124,8 +125,18 @@ impl eframe::App for App {
         }
         file_access::unconfined(|| self.app.ui(ui));
         self.laser_panel.show(ui.ctx());
-        egui::Window::new("LaserCraft Camera Tools").default_pos(egui::pos2(10.0, 55.0)).show(ui.ctx(), |ui| { if ui.button("Camera placement overlay").clicked() { self.camera_overlay.open = true; } });
-        self.camera_overlay.show(ui.ctx(),self.laser_panel.camera_gcode(),self.laser_panel.camera_bed_width(),self.laser_panel.camera_bed_height(),self.laser_panel.camera_max_s());
+        egui::Window::new("LaserCraft Camera Tools").default_pos(egui::pos2(10.0, 55.0)).show(ui.ctx(), |ui| {
+            if ui.button("Camera placement overlay").clicked() {
+                self.camera_overlay.open = true;
+            }
+        });
+        self.camera_overlay.show(
+            ui.ctx(),
+            self.laser_panel.camera_gcode(),
+            self.laser_panel.camera_bed_width(),
+            self.laser_panel.camera_bed_height(),
+            self.laser_panel.camera_max_s(),
+        );
         // Preferences are written when confirmed, not only at exit: a session ended any other way
         // (the system shutting down, the process ended or crashing) used to lose them (#1747).
         if self.app.take_prefs_changed() {
@@ -1002,7 +1013,15 @@ fn main() -> std::process::ExitCode {
                 created.ready();
                 // The content and the pointer stay aligned on Windows (#1758).
                 let window_frame = window_frame::service(cc, custom_titlebar);
-                Ok(Box::new(App { app, laser_panel: laser_panel::LaserPanel::default(), camera_overlay: camera_overlay::CameraOverlay::default(), graphics_loss, graphics_lost: false, frames: 0, window_frame }))
+                Ok(Box::new(App {
+                    app,
+                    laser_panel: laser_panel::LaserPanel::default(),
+                    camera_overlay: camera_overlay::CameraOverlay::default(),
+                    graphics_loss,
+                    graphics_lost: false,
+                    frames: 0,
+                    window_frame,
+                }))
             }),
         )
     });

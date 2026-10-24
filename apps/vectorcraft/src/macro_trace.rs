@@ -43,11 +43,17 @@ mod tests {
     #[test]
     fn trace_has_correct_order_and_timestamps() {
         let db = RoutineDatabase {
-            routines: vec![Routine { name: "demo".into(), steps: vec![
-                Step::SetOn { device: 2 }, Step::WaitMs { ms: 125 },
-                Step::SetPwm { device: 3, percent: 40 }, Step::WaitMs { ms: 75 },
-                Step::SetOff { device: 2 },
-            ] }], bindings: vec![],
+            routines: vec![Routine {
+                name: "demo".into(),
+                steps: vec![
+                    Step::SetOn { device: 2 },
+                    Step::WaitMs { ms: 125 },
+                    Step::SetPwm { device: 3, percent: 40 },
+                    Step::WaitMs { ms: 75 },
+                    Step::SetOff { device: 2 },
+                ],
+            }],
+            bindings: vec![],
         };
         let trace = build_trace(&db, "demo", Context::default()).unwrap();
         assert_eq!(trace.entries.iter().map(|e| e.elapsed_ms).collect::<Vec<_>>(), vec![0, 0, 125, 125, 200]);
