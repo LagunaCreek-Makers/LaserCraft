@@ -30,7 +30,7 @@ pub fn canvas_path(source: &str) -> Result<Vec<usize>, String> {
 }
 
 pub fn valid_canvas_path(steps: &[Step], path: &[usize]) -> bool {
-    if path.is_empty() || path.len() % 2 == 0 {
+    if path.is_empty() || path.len().is_multiple_of(2) {
         return false;
     }
     let mut lane = steps;

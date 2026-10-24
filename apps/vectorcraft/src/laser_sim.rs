@@ -31,10 +31,10 @@ pub fn simulate(source: &str, max_s: f64) -> Simulation {
         let mut number = String::new();
         for c in code.chars().chain(std::iter::once(' ')) {
             if c.is_ascii_alphabetic() || c == ' ' {
-                if let Some(k) = current.take() {
-                    if let Ok(v) = number.parse::<f64>() {
-                        words.push((k, v));
-                    }
+                if let Some(k) = current.take()
+                    && let Ok(v) = number.parse::<f64>()
+                {
+                    words.push((k, v));
                 }
                 number.clear();
                 if c != ' ' {
@@ -241,7 +241,9 @@ mod phase16_tests {
 /// Each laser-on segment contributes length-weighted exposure to intersected cells.
 #[derive(Clone, Debug)]
 pub struct ExposureGrid {
+    #[allow(dead_code, reason = "grid size, kept beside `values` for callers")]
     pub width: usize,
+    #[allow(dead_code, reason = "grid size, kept beside `values` for callers")]
     pub height: usize,
     pub values: Vec<f32>,
     pub peak: f32,
@@ -337,6 +339,7 @@ pub fn estimated_motion_time(sim: &Simulation, settings: MotionEstimate) -> f64 
 
 /// Simple 8-bit raster image to bidirectional GRBL scanlines.
 /// Pixels are row-major, with 0 black and 255 white. Offline output only.
+#[allow(dead_code, reason = "library API from phase 18, not wired to image import yet")]
 pub fn raster_to_gcode(
     pixels: &[u8],
     width: usize,

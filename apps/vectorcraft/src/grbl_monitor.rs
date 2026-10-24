@@ -14,6 +14,7 @@ pub struct GrblStatus {
     pub machine_position: Option<[f64; 3]>,
     pub work_position: Option<[f64; 3]>,
     pub alarm: Option<String>,
+    #[allow(dead_code, reason = "collected from `$I` replies; not shown in the panel yet")]
     pub identity: Vec<String>,
     pub raw: String,
 }
@@ -23,6 +24,7 @@ pub enum Event {
     Disconnected(String),
     Line(String),
     Status(GrblStatus),
+    #[allow(dead_code, reason = "the panel handles it; port scans do not send it yet")]
     Ports(Vec<String>),
     JobProgress(Progress),
 }
@@ -156,24 +158,23 @@ impl Monitor {
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
-                if let Some(s) = stream.as_mut() {
-                    if s.timed_out(Duration::from_secs(15)) {
+                if let Some(s) = stream.as_mut()
+                    && s.timed_out(Duration::from_secs(15))
+                {
+                    let _ = tx.send(Event::JobProgress(s.progress.clone()));
+                    let _ = tx.send(Event::Disconnected("Job acknowledgement timed out; reconnect and inspect controller before retrying".into()));
+                    return;
+                }
+                if let Some(s) = stream.as_mut()
+                    && let Some(line) = s.next_line()
+                {
+                    if let Err(e) = port.write_all(line.as_bytes()) {
+                        s.abort(&format!("Write failed: {e}"));
                         let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                        let _ =
-                            tx.send(Event::Disconnected("Job acknowledgement timed out; reconnect and inspect controller before retrying".into()));
+                        let _ = tx.send(Event::Disconnected(e.to_string()));
                         return;
                     }
-                }
-                if let Some(s) = stream.as_mut() {
-                    if let Some(line) = s.next_line() {
-                        if let Err(e) = port.write_all(line.as_bytes()) {
-                            s.abort(&format!("Write failed: {e}"));
-                            let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                            let _ = tx.send(Event::Disconnected(e.to_string()));
-                            return;
-                        }
-                        let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                    }
+                    let _ = tx.send(Event::JobProgress(s.progress.clone()));
                 }
                 if last_poll.elapsed() >= Duration::from_millis(500) {
                     if let Err(e) = port.write_all(b"?") {
@@ -188,11 +189,11 @@ impl Monitor {
                             if *byte == b'\n' {
                                 let line = String::from_utf8_lossy(&pending).trim().to_string();
                                 pending.clear();
-                                if let Some(s) = stream.as_mut() {
-                                    if line == "ok" || line.starts_with("error:") || line.starts_with("ALARM:") {
-                                        s.response(&line);
-                                        let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                                    }
+                                if let Some(s) = stream.as_mut()
+                                    && (line == "ok" || line.starts_with("error:") || line.starts_with("ALARM:"))
+                                {
+                                    s.response(&line);
+                                    let _ = tx.send(Event::JobProgress(s.progress.clone()));
                                 }
                                 if line.is_empty() {
                                     continue;

@@ -40,6 +40,7 @@ mod cursor_theme;
 #[cfg(feature = "wgpu")]
 mod gpu;
 mod grbl_monitor;
+#[cfg(test)]
 mod grbl_simulator;
 mod grbl_stream;
 mod laser_panel;

@@ -55,7 +55,7 @@ pub fn svg_to_job(svg: &str, speed: f64, power: f64, passes: u32) -> Result<Job,
         if n.ancestors().any(|p| p.is_element() && p.attribute("transform").is_some()) {
             return Err(SvgCamError::Unsupported("SVG transforms must be flattened first".into()));
         }
-        let mut pts = Vec::new();
+        let pts: Vec<Point>;
         let mut closed = false;
         match tag {
             "rect" => {
@@ -175,7 +175,7 @@ pub fn svg_to_job(svg: &str, speed: f64, power: f64, passes: u32) -> Result<Job,
                     .collect();
                 closed = true;
             }
-            _ => unreachable!(),
+            other => return Err(SvgCamError::Unsupported(format!("<{other}> is not supported"))),
         }
         emit(&pts, closed, speed, power, passes, &mut ops);
     }

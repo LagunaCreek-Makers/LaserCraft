@@ -51,12 +51,14 @@ pub fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code, reason = "capture statistics API; the inspector does not use it yet")]
 pub struct CaptureAnalysis {
     pub by_first_byte: BTreeMap<u8, usize>,
     pub empty: usize,
     pub lengths: BTreeMap<usize, usize>,
 }
 impl CaptureAnalysis {
+    #[allow(dead_code, reason = "capture statistics API; the inspector does not use it yet")]
     pub fn add(&mut self, bytes: &[u8]) {
         *self.lengths.entry(bytes.len()).or_default() += 1;
         if let Some(first) = bytes.first() {

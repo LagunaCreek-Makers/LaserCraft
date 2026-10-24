@@ -21,6 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.95.0'
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Linux native build dependencies
         run: |
@@ -32,12 +33,12 @@ jobs:
         run: cargo test -p lasercraft-core --locked
       - name: Check VectorCraft desktop integration
         run: cargo check -p vectorcraft --locked
-      - name: Test laser simulation
-        run: cargo test -p vectorcraft laser_sim --locked
-      - name: Test camera calibration
-        run: cargo test -p vectorcraft camera_calibration --locked
-      - name: Test Ruida protocol
-        run: cargo test -p vectorcraft ruida_protocol --locked
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (LaserCraft packages)
+        run: cargo clippy -p vectorcraft -p lasercraft-core -p lasercraft-cli --all-targets --locked -- -D warnings
+      - name: Test desktop app and LaserCraft CLI
+        run: cargo test -p vectorcraft -p lasercraft-cli --locked
       - name: Build desktop release
         run: cargo build --release -p vectorcraft --locked
       - name: Upload compiled desktop executable

@@ -14,6 +14,7 @@ pub struct Datagram {
     pub received_unix_ms: u128,
     pub bytes: usize,
     pub prefix_hex: String,
+    #[allow(dead_code, reason = "captured for export; only the prefix is shown so far")]
     pub payload_hex: String,
     pub fingerprint: String,
 }

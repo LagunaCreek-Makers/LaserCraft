@@ -2,17 +2,13 @@
 //! Never use a G-code accessory to actuate fire suppression or another safety system.
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AccessoryTransport {
+    #[default]
     Gcode,
     Serial,
     ModbusTcp,
     Mqtt,
-}
-impl Default for AccessoryTransport {
-    fn default() -> Self {
-        Self::Gcode
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,15 +55,11 @@ pub struct Accessory {
     pub pre_delay_ms: u32,
     pub post_delay_ms: u32,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AccessoryMode {
+    #[default]
     OnOff,
     Pwm,
-}
-impl Default for AccessoryMode {
-    fn default() -> Self {
-        Self::OnOff
-    }
 }
 impl Default for Accessory {
     fn default() -> Self {
@@ -391,7 +383,7 @@ pub fn send_independent(a: &Accessory, activate: bool) -> Result<(), String> {
             } else {
                 e.mqtt_off.clone()
             };
-            let (host, port) = e.address.rsplit_once(':').map(|(h, p)| (h, p)).unwrap_or((&e.address, "1883"));
+            let (host, port) = e.address.rsplit_once(':').unwrap_or((&e.address, "1883"));
             let status = std::process::Command::new("mosquitto_pub")
                 .args(["-h", host, "-p", port, "-t", &e.mqtt_topic, "-m", &payload, "-q", "1"])
                 .status()
@@ -406,8 +398,7 @@ mod phase31_tests {
     use super::*;
     #[test]
     fn independent_does_not_enter_gcode() {
-        let mut a = Accessory::default();
-        a.enabled = true;
+        let mut a = Accessory { enabled: true, ..Default::default() };
         a.endpoint.transport = AccessoryTransport::Mqtt;
         a.endpoint.address = "localhost:1883".into();
         a.endpoint.mqtt_topic = "laser/fan".into();
@@ -416,8 +407,7 @@ mod phase31_tests {
     }
     #[test]
     fn modbus_pwm_rejected() {
-        let mut a = Accessory::default();
-        a.enabled = true;
+        let mut a = Accessory { enabled: true, ..Default::default() };
         a.mode = AccessoryMode::Pwm;
         a.endpoint.transport = AccessoryTransport::ModbusTcp;
         a.endpoint.address = "localhost:502".into();

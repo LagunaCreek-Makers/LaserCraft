@@ -14,6 +14,7 @@ pub enum MacroEvent {
     InputLow,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names, reason = "variant names are the saved JSON format")]
 pub enum MacroAction {
     SetOn { device: usize },
     SetOff { device: usize },
@@ -117,8 +118,7 @@ mod tests {
     }
     #[test]
     fn rejects_gcode_transport() {
-        let mut a = Accessory::default();
-        a.enabled = true;
+        let a = Accessory { enabled: true, ..Default::default() };
         let c = MacroConfig {
             rules: vec![MacroRule {
                 name: "test".into(),

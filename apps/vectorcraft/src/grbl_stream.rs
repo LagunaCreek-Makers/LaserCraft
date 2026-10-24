@@ -80,9 +80,6 @@ impl Stream {
             false
         }
     }
-    pub fn has_inflight(&self) -> bool {
-        self.inflight
-    }
     pub fn abort(&mut self, reason: &str) {
         self.queue.clear();
         self.progress.failed = Some(reason.into());

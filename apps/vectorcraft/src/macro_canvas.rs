@@ -214,10 +214,11 @@ fn drop_target(ui: &mut egui::Ui, drag: &mut Option<DragState>, pending: &mut Op
     if hovered && drag.is_some() {
         ui.painter().line_segment([rect.left_center(), rect.right_center()], (2.0, Color32::LIGHT_BLUE));
     }
-    if hovered && ui.input(|i| i.pointer.any_released()) {
-        if let Some(d) = drag.take() {
-            *pending = Some((d.source, lane.to_vec(), at));
-        }
+    if hovered
+        && ui.input(|i| i.pointer.any_released())
+        && let Some(d) = drag.take()
+    {
+        *pending = Some((d.source, lane.to_vec(), at));
     }
 }
 fn block_label(step: &Step) -> &'static str {
@@ -232,9 +233,10 @@ fn block_label(step: &Step) -> &'static str {
         Step::SetVariable { .. } => "VARIABLE",
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn lane_ui(
     ui: &mut egui::Ui,
-    steps: &mut Vec<Step>,
+    steps: &mut [Step],
     lane: &[usize],
     drag: &mut Option<DragState>,
     pending: &mut Option<(Source, Vec<usize>, usize)>,
@@ -393,9 +395,7 @@ pub fn show(ui: &mut egui::Ui, steps: &mut Vec<Step>, drag: &mut Option<DragStat
         return error;
     }
     if let Some(path) = state.selected.take() {
-        let (lane, i) = split_block(&path).unwrap();
         // "Copy" selects an existing block; "Paste after" selects an insertion position.
-        let _ = (lane, i);
         if let Err(e) = state.copy(steps, &path) {
             return Some(e);
         }

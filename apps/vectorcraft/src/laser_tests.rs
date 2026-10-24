@@ -164,10 +164,6 @@ fn validate(s: &TestSettings) -> Result<(), String> {
     }
     Ok(())
 }
-fn mark(code: &mut String, x: f64, y: f64, feed: f64, power: f64, max_s: u32) {
-    let p = ((power / 100.0) * max_s as f64).round() as u32;
-    code.push_str(&format!("G0 X{x:.3} Y{y:.3}\nM4 S{p}\nG1 X{:.3} Y{y:.3} F{feed:.1}\nM5\n", x + 0.5));
-}
 fn rectangle(code: &mut String, x: f64, y: f64, size: f64, feed: f64, power: f64, max_s: u32) {
     let p = ((power / 100.0) * max_s as f64).round() as u32;
     code.push_str(&format!(
@@ -178,11 +174,13 @@ fn rectangle(code: &mut String, x: f64, y: f64, size: f64, feed: f64, power: f64
         y + size
     ));
 }
+#[allow(clippy::too_many_arguments)]
 fn scanline(code: &mut String, x: f64, y: f64, w: f64, speed: f64, power: f64, max_s: u32, reverse: bool) {
     let (a, b) = if reverse { (x + w, x) } else { (x, x + w) };
     let p = ((power / 100.0) * max_s as f64).round() as u32;
     code.push_str(&format!("M5\nG0 X{a:.3} Y{y:.3}\nM4 S{p}\nG1 X{b:.3} Y{y:.3} F{speed:.1}\nM5\n"));
 }
+#[allow(clippy::too_many_arguments)]
 fn raster(code: &mut String, x: f64, y: f64, size: f64, pitch: f64, speed: f64, power: f64, max_s: u32, bidirectional: bool) {
     let lines = (size / pitch).floor() as usize;
     for n in 0..=lines {
@@ -190,6 +188,7 @@ fn raster(code: &mut String, x: f64, y: f64, size: f64, pitch: f64, speed: f64, 
         scanline(code, x, yy, size, speed, power, max_s, bidirectional && n % 2 == 1);
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn gradient(
     code: &mut String,
     x: f64,
@@ -293,8 +292,7 @@ mod tests {
     #[test]
     fn all_patterns_generate() {
         for kind in TestKind::ALL {
-            let mut s = TestSettings::default();
-            s.kind = kind;
+            let s = TestSettings { kind, ..Default::default() };
             let g = generate(&s).unwrap();
             assert!(g.contains("G21"));
             assert!(g.ends_with("; End of test pattern\n"));
@@ -302,14 +300,12 @@ mod tests {
     }
     #[test]
     fn rejects_out_of_bounds() {
-        let mut s = TestSettings::default();
-        s.origin_x = 299.0;
+        let s = TestSettings { origin_x: 299.0, ..Default::default() };
         assert!(generate(&s).is_err());
     }
     #[test]
     fn rejects_nonfinite() {
-        let mut s = TestSettings::default();
-        s.power_max = f64::NAN;
+        let s = TestSettings { power_max: f64::NAN, ..Default::default() };
         assert!(generate(&s).is_err());
     }
     #[test]
@@ -320,8 +316,7 @@ mod tests {
     }
     #[test]
     fn gradient_varies_power() {
-        let mut s = TestSettings::default();
-        s.kind = TestKind::GrayscaleGradient;
+        let s = TestSettings { kind: TestKind::GrayscaleGradient, ..Default::default() };
         let g = generate(&s).unwrap();
         assert!(g.contains("M4 S"));
         let distinct: std::collections::HashSet<_> = g.lines().filter(|l| l.starts_with("M4 S")).collect();
@@ -329,16 +324,14 @@ mod tests {
     }
     #[test]
     fn dither_is_binary() {
-        let mut s = TestSettings::default();
-        s.kind = TestKind::Dither;
+        let s = TestSettings { kind: TestKind::Dither, ..Default::default() };
         let g = generate(&s).unwrap();
         let levels: std::collections::HashSet<_> = g.lines().filter(|l| l.starts_with("M4 S")).collect();
         assert_eq!(levels.len(), 2);
     }
     #[test]
     fn invalid_gamma() {
-        let mut s = TestSettings::default();
-        s.gamma = 0.0;
+        let s = TestSettings { gamma: 0.0, ..Default::default() };
         assert!(generate(&s).is_err());
     }
 }

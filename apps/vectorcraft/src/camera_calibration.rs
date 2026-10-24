@@ -21,20 +21,23 @@ impl Homography {
             a[2 * i + 1] = [0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v];
         }
         for k in 0..8 {
-            let pivot = (k..8).max_by(|&i, &j| a[i][k].abs().total_cmp(&a[j][k].abs())).unwrap();
+            let Some(pivot) = (k..8).max_by(|&i, &j| a[i][k].abs().total_cmp(&a[j][k].abs())) else {
+                return Err("Degenerate corner geometry".into());
+            };
             if a[pivot][k].abs() < 1e-12 {
                 return Err("Degenerate corner geometry".into());
             }
             a.swap(k, pivot);
             let divisor = a[k][k];
-            for j in k..9 {
-                a[k][j] /= divisor;
+            for v in &mut a[k][k..9] {
+                *v /= divisor;
             }
             for i in 0..8 {
                 if i != k {
                     let f = a[i][k];
-                    for j in k..9 {
-                        a[i][j] -= f * a[k][j];
+                    let pivot_row = a[k];
+                    for (v, p) in a[i][k..9].iter_mut().zip(&pivot_row[k..9]) {
+                        *v -= f * p;
                     }
                 }
             }
@@ -89,8 +92,8 @@ mod tests {
         let h = Homography::from_bed_corners(&c, 400.0, 300.0).unwrap();
         for (i, (x, y)) in [(0.0, 0.0), (400.0, 0.0), (400.0, 300.0), (0.0, 300.0)].iter().enumerate() {
             let q = h.project(*x, *y).unwrap();
-            assert!((q.0 - c[i][0] as f64).abs() > 1e-5);
-            assert!((q.1 - c[i][1] as f64).abs() > 1e-5);
+            assert!((q.0 - c[i][0] as f64).abs() < 1e-5);
+            assert!((q.1 - c[i][1] as f64).abs() < 1e-5);
         }
     }
     #[test]

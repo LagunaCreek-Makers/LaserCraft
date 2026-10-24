@@ -121,13 +121,13 @@ impl Debugger {
                 return true;
             }
         }
-        if let Ok(id) = self.break_device.trim().parse::<usize>() {
-            if id < 256 {
-                match step {
-                    PlannedStep::On(d) if *d == id => return 100 >= self.break_pwm_at_least,
-                    PlannedStep::Pwm(d, p) if *d == id => return *p >= self.break_pwm_at_least,
-                    _ => {}
-                }
+        if let Ok(id) = self.break_device.trim().parse::<usize>()
+            && id < 256
+        {
+            match step {
+                PlannedStep::On(d) if *d == id => return 100 >= self.break_pwm_at_least,
+                PlannedStep::Pwm(d, p) if *d == id => return *p >= self.break_pwm_at_least,
+                _ => {}
             }
         }
         false
@@ -147,6 +147,7 @@ impl Debugger {
         self.cursor = self.cursor.saturating_add(1).min(count);
         self.paused = true;
     }
+    #[allow(dead_code, reason = "used by tests; the panel uses the conditional variant")]
     pub fn continue_until_breakpoint(&mut self, count: usize) {
         self.paused = false;
         let start = self.cursor.saturating_add(1);
@@ -200,9 +201,7 @@ mod phase45_tests {
     #[test]
     fn conditional_device_and_elapsed_breakpoints() {
         let p = vec![PlannedStep::On(1), PlannedStep::Wait(300), PlannedStep::Pwm(3, 75), PlannedStep::Off(1)];
-        let mut d = Debugger::default();
-        d.break_device = "3".into();
-        d.break_pwm_at_least = 70;
+        let mut d = Debugger { break_device: "3".into(), break_pwm_at_least: 70, ..Default::default() };
         d.continue_with_conditions(&p);
         assert_eq!(d.cursor, 3);
         d.reset();

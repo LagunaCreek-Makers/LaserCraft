@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 pub struct CameraOverlay {
     pub open: bool,
-    source: String,
     device: String,
     image_path: String,
     texture: Option<TextureHandle>,
@@ -37,7 +36,6 @@ impl Default for CameraOverlay {
     fn default() -> Self {
         Self {
             open: false,
-            source: "File / snapshot".into(),
             device: "/dev/video0".into(),
             image_path: String::new(),
             texture: None,
@@ -159,7 +157,7 @@ impl CameraOverlay {
             }
         }
         if self.live {
-            let due = self.last_capture.map_or(true, |t| t.elapsed() >= Duration::from_millis(self.capture_interval_ms));
+            let due = self.last_capture.is_none_or(|t| t.elapsed() >= Duration::from_millis(self.capture_interval_ms));
             if due && self.frame_receiver.is_none() {
                 self.start_async_capture();
             }
@@ -176,7 +174,7 @@ impl CameraOverlay {
         egui::Window::new("LaserCraft | Camera Placement").open(&mut open).default_width(690.0).resizable(true).show(ctx,|ui|{
             ui.label("USB webcam snapshot / workpiece placement. OFFLINE preview only; never moves or fires the laser.");
             ui.horizontal(|ui|{
-                if ui.button("Open image…").clicked(){if let Some(path)=rfd::FileDialog::new().add_filter("Images", &["png","jpg","jpeg","webp"]).pick_file(){self.load(ctx,path);}}
+                if ui.button("Open image…").clicked()&& let Some(path)=rfd::FileDialog::new().add_filter("Images", &["png","jpg","jpeg","webp"]).pick_file(){self.load(ctx,path);}
                 if ui.button("Capture USB webcam still").clicked(){self.capture(ctx);}
             });
             ui.horizontal(|ui|{ui.label("Camera device");ui.text_edit_singleline(&mut self.device);});
@@ -191,8 +189,8 @@ impl CameraOverlay {
                 ui.horizontal(|ui| {ui.label("Tangential p1/p2");ui.add(egui::DragValue::new(&mut self.lens.p1).speed(0.0001));ui.add(egui::DragValue::new(&mut self.lens.p2).speed(0.0001));});
                 ui.horizontal(|ui| {ui.label("Principal cx/cy");ui.add(egui::DragValue::new(&mut self.lens.cx).speed(0.001));ui.add(egui::DragValue::new(&mut self.lens.cy).speed(0.001));});
                 ui.horizontal(|ui| {ui.label("Focal fx/fy");ui.add(egui::DragValue::new(&mut self.lens.fx).speed(0.001));ui.add(egui::DragValue::new(&mut self.lens.fy).speed(0.001));});
-                if ui.button("Import automatic checkerboard calibration…").clicked() {
-                    if let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+                if ui.button("Import automatic checkerboard calibration…").clicked()
+                    && let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
                         let result=(|| -> Result<(Lens,f64),String> {
                             let raw=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
                             let v:serde_json::Value=serde_json::from_str(&raw).map_err(|e|e.to_string())?;
@@ -211,7 +209,6 @@ impl CameraOverlay {
                         })();
                         match result {Ok((lens,rms))=>{self.lens=lens;self.lens_enabled=true;self.corners.clear();self.error=format!("Imported lens calibration (RMS {rms:.3}px). Recalibrate bed corners and validate independent points.");},Err(e)=>self.error=format!("Calibration import rejected: {e}")}
                     }
-                }
                 if ui.button("Reset lens coefficients").clicked(){self.lens=Lens::default();self.lens_enabled=false;}
                 ui.small("Coefficients must be measured from a calibration target. This is not automatic checkerboard detection.");
             });
@@ -229,14 +226,13 @@ impl CameraOverlay {
             if self.corners.len()==4 {ui.colored_label(Color32::LIGHT_GREEN,"Projective bed mapping active (lens distortion NOT corrected). Verify against measured reference points.");}
             ui.horizontal(|ui| {ui.label("Artwork placement offset (mm)");ui.add(egui::DragValue::new(&mut self.offset_x).speed(0.1).prefix("X "));ui.add(egui::DragValue::new(&mut self.offset_y).speed(0.1).prefix("Y "));});
             ui.horizontal(|ui| {
-                if ui.button("Save calibration…").clicked() && self.corners.len()==4 {
-                    if let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).save_file(){
+                if ui.button("Save calibration…").clicked() && self.corners.len()==4
+                    && let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).save_file(){
                         let data=serde_json::json!({"version":1,"image_size":self.image_size,"bed_width_mm":bed_w,"bed_height_mm":bed_h,"corners":self.corners,"lens_enabled":self.lens_enabled,"lens":[self.lens.k1,self.lens.k2,self.lens.p1,self.lens.p2,self.lens.cx,self.lens.cy,self.lens.fx,self.lens.fy]});
                         if let Err(e)=std::fs::write(path,data.to_string()){self.error=e.to_string();}
                     }
-                }
-                if ui.button("Load calibration…").clicked(){
-                    if let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file(){
+                if ui.button("Load calibration…").clicked()
+                    && let Some(path)=rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file(){
                         match std::fs::read_to_string(path).ok().and_then(|s|serde_json::from_str::<serde_json::Value>(&s).ok()) {
                             Some(v) => {
                                 let parsed=(|| -> Option<Vec<[f32;2]>> {
@@ -248,27 +244,25 @@ impl CameraOverlay {
                                 })();
                                 if let Some(c)=parsed {
                                     self.corners=c;self.calibrating=false;
-                                    if let Some(a)=v["lens"].as_array() {if a.len()==8 {
+                                    if let Some(a)=v["lens"].as_array()&& a.len()==8 {
                                         let vals:Vec<f64>=a.iter().filter_map(|x|x.as_f64()).collect();
                                         if vals.len()==8 {let lens=Lens{k1:vals[0],k2:vals[1],p1:vals[2],p2:vals[3],cx:vals[4],cy:vals[5],fx:vals[6],fy:vals[7]};if lens.valid(){self.lens=lens;self.lens_enabled=v["lens_enabled"].as_bool().unwrap_or(false);}}
-                                    }}
+                                    }
                                 } else {self.error="Calibration does not match current image size or bed dimensions".into();}
                             },None=>self.error="Cannot read calibration JSON".into()
                         }
                     }
-                }
             });
             let Some(tex)=&self.texture else {ui.label("Open an image or capture a webcam still to begin.");return;};
-            let size=tex.size_vec2();let width=ui.available_width().min(760.0).max(250.0);
+            let size=tex.size_vec2();let width=ui.available_width().clamp(250.0, 760.0);
             let desired=egui::vec2(width,width*size.y/size.x);
             let (rect,response)=ui.allocate_exact_size(desired,Sense::click_and_drag());
             ui.painter().image(tex.id(),rect,Rect::from_min_max(Pos2::ZERO,egui::pos2(1.0,1.0)),Color32::WHITE.gamma_multiply(self.opacity));
-            if self.calibrating && response.clicked(){
-                if let Some(pos)=response.interact_pointer_pos(){
+            if self.calibrating && response.clicked()
+                && let Some(pos)=response.interact_pointer_pos(){
                     self.corners.push([((pos.x-rect.min.x)/rect.width()).clamp(0.0,1.0),((pos.y-rect.min.y)/rect.height()).clamp(0.0,1.0)]);
                     if self.corners.len()==4 {self.calibrating=false;}
                 }
-            }
             for (i,p) in self.corners.iter().enumerate(){
                 let pos=egui::pos2(rect.left()+p[0]*rect.width(),rect.top()+p[1]*rect.height());
                 ui.painter().circle_filled(pos,5.0,Color32::YELLOW);
@@ -300,8 +294,8 @@ impl CameraOverlay {
             };
             if !self.calibrating {
                 if response.drag_started() {self.drag_origin=Some((self.offset_x,self.offset_y));}
-                if response.dragged() {
-                    if let Some((ox,oy))=self.drag_origin {
+                if response.dragged()
+                    && let Some((ox,oy))=self.drag_origin {
                         let d=response.drag_delta();
                         let du=d.x as f64/rect.width() as f64;
                         let dv=d.y as f64/rect.height() as f64;
@@ -314,7 +308,6 @@ impl CameraOverlay {
                             self.offset_y=oy+b.1-a.1;
                         }
                     }
-                }
                 if response.drag_stopped() {self.drag_origin=None;}
             }
             let painter=ui.painter().with_clip_rect(rect);
