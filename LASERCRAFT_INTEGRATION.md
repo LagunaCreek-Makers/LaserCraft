@@ -68,3 +68,28 @@ it was refused (art off the bed). **Document layers** lists the document's layer
 (`laser.layers`) and sets their speed, power, passes and on/off with `laser.setLayer` (one undoable
 step each). The dry run draws the bed with the machine's origin corner. The pasted-SVG section is
 kept as legacy: it ignores the origin.
+
+### Fill mode
+
+A layer in **Fill** mode (`laser.setLayer {mode: fill, interval, angle, bidirectional, overscan,
+crosshatch}`, or the panel's layer table) engraves the inside of its closed shapes with parallel
+scan lines instead of cutting their outlines. Each shape's fill rule (nonzero or even-odd) decides
+what is inside, so holes stay empty, and overlapping shapes are burnt once per line. `interval` is
+the line spacing (0.01–10 mm), `angle` turns the lines (0° horizontal, 90° vertical),
+`bidirectional` runs every other line back, `crosshatch` fills again at right angles, and
+`overscan` (0–50 mm) runs the head on past each end of a line at power 0 (S0) so it burns at
+speed; overscan is shortened where it would leave the bed, with a warning. The dry run shows the
+overscan as travel.
+
+### Image mode
+
+A layer in **Image** mode (`laser.setLayer {mode: image, interval, dither, power, minPower,
+negative, bidirectional, overscan}`) engraves the images placed on it line by line; paths on it are
+left out (with a warning), as images on Line and Fill layers are. Each image is resampled at
+`interval` along its own rows and columns (a turned image is engraved along its turned rows), each
+sample the area average of the pixels under it; transparent pixels never burn. `dither` turns grey
+levels into power: `floydSteinberg` (default) or `jarvis` error diffusion, `ordered` (4 × 4 Bayer)
+or `threshold` burn at full power or not at all; `grayscale` sets each sample's power between
+`minPower` and `power` by its darkness. `negative` burns the light parts. Overscan runs at S0 and
+stops at the bed's edges. Images are capped at 16 million samples (40 000 along a side) at the
+chosen interval: a larger one asks for a larger interval instead of allocating it.

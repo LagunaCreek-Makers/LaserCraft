@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use egui::{Pos2, Rect};
-use lasercraft_cam::Origin;
+use lasercraft_cam::{Dither, LaserMode, Origin};
 use serde_json::{Value, json};
 use vectorcraft_ui_egui::theme::Tokens;
 
@@ -64,6 +64,17 @@ pub struct LayerRow {
     pub power: f64,
     pub passes: u32,
     pub enabled: bool,
+    pub mode: LaserMode,
+    /// Fill: line spacing (mm), angle (degrees), back-and-forth lines, overscan (mm), crosshatch.
+    pub interval: f64,
+    pub angle: f64,
+    pub bidirectional: bool,
+    pub overscan: f64,
+    pub crosshatch: bool,
+    /// Image: dithering, the lightest grey's power (%), burn the light parts.
+    pub dither: Dither,
+    pub min_power: f64,
+    pub negative: bool,
     /// The layer has settings of its own (else it cuts with its parent's or the defaults).
     pub custom: bool,
 }
@@ -77,11 +88,35 @@ impl LayerRow {
             power: v["power"].as_f64()?,
             passes: u32::try_from(v["passes"].as_u64()?).ok()?,
             enabled: v["enabled"].as_bool()?,
+            mode: v["mode"].as_str().and_then(LaserMode::parse).unwrap_or_default(),
+            interval: v["interval"].as_f64().unwrap_or(0.1),
+            angle: v["angle"].as_f64().unwrap_or(0.0),
+            bidirectional: v["bidirectional"].as_bool().unwrap_or(true),
+            overscan: v["overscan"].as_f64().unwrap_or(0.0),
+            crosshatch: v["crosshatch"].as_bool().unwrap_or(false),
+            dither: v["dither"].as_str().and_then(Dither::parse).unwrap_or_default(),
+            min_power: v["minPower"].as_f64().unwrap_or(0.0),
+            negative: v["negative"].as_bool().unwrap_or(false),
             custom: v["custom"].as_bool().unwrap_or(false),
         })
     }
     fn params(&self) -> Value {
-        json!({ "layer": self.id, "speed": self.speed, "power": self.power, "passes": self.passes, "enabled": self.enabled, "mode": "line" })
+        json!({
+            "layer": self.id,
+            "speed": self.speed,
+            "power": self.power,
+            "passes": self.passes,
+            "enabled": self.enabled,
+            "mode": self.mode.id(),
+            "interval": self.interval,
+            "angle": self.angle,
+            "bidirectional": self.bidirectional,
+            "overscan": self.overscan,
+            "crosshatch": self.crosshatch,
+            "dither": self.dither.id(),
+            "minPower": self.min_power,
+            "negative": self.negative,
+        })
     }
 }
 
@@ -223,7 +258,7 @@ impl DocExport {
             }
             let mut apply: Option<LayerRow> = None;
             egui::Grid::new("lasercraft_doc_layers").striped(true).show(ui, |ui| {
-                for h in ["Layer", "On", "Speed (mm/min)", "Power (%)", "Passes", ""] {
+                for h in ["Layer", "On", "Mode", "Speed (mm/min)", "Power (%)", "Passes", ""] {
                     ui.strong(h);
                 }
                 ui.end_row();
@@ -236,6 +271,11 @@ impl DocExport {
                         apply = Some(LayerRow { enabled: e.enabled, ..row.clone() });
                     }
                     let mut changed = false;
+                    egui::ComboBox::from_id_salt(("lasercraft_layer_mode", row.id)).selected_text(e.mode.label()).show_ui(ui, |ui| {
+                        for m in LaserMode::ALL {
+                            changed |= ui.selectable_value(&mut e.mode, m, m.label()).changed();
+                        }
+                    });
                     changed |= ui.add(egui::DragValue::new(&mut e.speed).range(1.0..=100_000.0).speed(10.0)).changed();
                     changed |= ui.add(egui::DragValue::new(&mut e.power).range(0.0..=100.0).speed(0.5)).changed();
                     changed |= ui.add(egui::DragValue::new(&mut e.passes).range(1..=100)).changed();
@@ -244,6 +284,40 @@ impl DocExport {
                         apply = Some(e.clone());
                     }
                     ui.end_row();
+                    if e.mode == LaserMode::Fill {
+                        // The fill's own settings, on a row under the layer's.
+                        ui.label("");
+                        ui.label("");
+                        ui.label("Fill");
+                        changed |= ui.add(egui::DragValue::new(&mut e.interval).range(0.01..=10.0).speed(0.005).prefix("every ").suffix(" mm")).changed();
+                        changed |= ui.add(egui::DragValue::new(&mut e.angle).range(-360.0..=360.0).speed(1.0).suffix("°")).changed();
+                        changed |= ui.add(egui::DragValue::new(&mut e.overscan).range(0.0..=50.0).speed(0.1).prefix("overscan ").suffix(" mm")).changed();
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut e.bidirectional, "Both ways").changed();
+                            changed |= ui.checkbox(&mut e.crosshatch, "Crosshatch").changed();
+                        });
+                        ui.end_row();
+                    }
+                    if e.mode == LaserMode::Image {
+                        // The image's own settings, on a row under the layer's.
+                        ui.label("");
+                        ui.label("");
+                        ui.label("Image");
+                        egui::ComboBox::from_id_salt(("lasercraft_layer_dither", row.id)).selected_text(e.dither.label()).show_ui(ui, |ui| {
+                            for d in Dither::ALL {
+                                changed |= ui.selectable_value(&mut e.dither, d, d.label()).changed();
+                            }
+                        });
+                        changed |= ui.add(egui::DragValue::new(&mut e.interval).range(0.01..=10.0).speed(0.005).prefix("every ").suffix(" mm")).changed();
+                        changed |= ui.add(egui::DragValue::new(&mut e.min_power).range(0.0..=e.power).speed(0.5).prefix("min ").suffix(" %")).changed();
+                        changed |= ui.add(egui::DragValue::new(&mut e.overscan).range(0.0..=50.0).speed(0.1).prefix("overscan ").suffix(" mm")).changed();
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut e.bidirectional, "Both ways").changed();
+                            changed |= ui.checkbox(&mut e.negative, "Negative").changed();
+                        });
+                        ui.end_row();
+                    }
+                    let dirty = dirty || e != *row;
                     if changed || dirty {
                         self.edits.insert(row.id, e);
                     }
@@ -252,7 +326,7 @@ impl DocExport {
             if let Some(row) = apply {
                 self.apply_layer(run, &row);
             }
-            ui.small("Mode: Line (cut along the paths). Settings save with the document; Edit › Undo takes them back.");
+            ui.small("Line cuts along the paths; Fill engraves inside closed shapes (holes stay empty); Image engraves placed images. Settings save with the document; Edit › Undo takes them back.");
         });
         action
     }
@@ -387,6 +461,70 @@ mod tests {
         s.execute("edit.undo", &json!({})).unwrap();
         d.refresh_layers(&mut runner(&mut s));
         assert!(!d.layers[0].custom);
+    }
+
+    /// A layer set to Fill in the table engraves scan lines, and the table shows its fill settings.
+    #[test]
+    fn a_fill_layer_from_the_table() {
+        let mut s = session();
+        let mut d = DocExport::default();
+        d.refresh_layers(&mut runner(&mut s));
+        let row = LayerRow { mode: LaserMode::Fill, interval: 1.0, angle: 0.0, overscan: 1.0, crosshatch: true, ..d.layers[0].clone() };
+        d.apply_layer(&mut runner(&mut s), &row);
+        assert!(d.error.is_none(), "{:?}", d.error);
+        let l = &d.layers[0];
+        assert_eq!((l.mode, l.interval, l.overscan, l.crosshatch), (LaserMode::Fill, 1.0, 1.0, true));
+        let g = d.generate(&mut runner(&mut s), Some(&BED), None).unwrap();
+        // 25 lines each way across the 25.4 mm square.
+        assert_eq!(g.contours, 50);
+        assert!(g.gcode.contains("M4 S0"));
+        // The dry run burns the scan lines only: the overscan runs at S0 show as travel.
+        let sim = crate::laser_sim::simulate(&g.gcode, 1000.0);
+        let on = sim.steps.iter().filter(|st| st.laser_on).count();
+        assert_eq!(on, 50);
+        assert!(sim.steps.len() > on);
+        // The fill row is drawn.
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = d.ui(ui, &mut runner(&mut s), Some(&BED), "Test machine");
+        });
+        out.textures_delta.clear();
+        let mut all = vec![];
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        out.shapes.iter().for_each(|c| texts(&c.shape, &mut all));
+        assert!(all.iter().any(|t| t == "Crosshatch") && all.iter().any(|t| t.contains("every")) && all.iter().any(|t| t == "1.000"), "{all:?}");
+    }
+
+    /// An Image layer from the table engraves a placed image.
+    #[test]
+    fn an_image_layer_from_the_table() {
+        let mut s = session();
+        // A 16 × 16 black-to-white image, 1 in square, placed through the engine.
+        let img = image::RgbaImage::from_fn(16, 16, |x, _| {
+            let v = (x * 17) as u8;
+            image::Rgba([v, v, v, 255])
+        });
+        let path = std::env::temp_dir().join(format!("lasercraft-panel-image-{}.png", std::process::id()));
+        img.save(&path).unwrap();
+        s.execute("file.place", &json!({"path": path.to_str().unwrap(), "link": false, "rect": [300, 300, 72, 72]})).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut d = DocExport::default();
+        d.refresh_layers(&mut runner(&mut s));
+        let row = LayerRow { mode: LaserMode::Image, dither: Dither::Grayscale, interval: 1.0, min_power: 5.0, power: 50.0, ..d.layers[0].clone() };
+        d.apply_layer(&mut runner(&mut s), &row);
+        assert!(d.error.is_none(), "{:?}", d.error);
+        assert_eq!((d.layers[0].mode, d.layers[0].dither, d.layers[0].min_power), (LaserMode::Image, Dither::Grayscale, 5.0));
+        let g = d.generate(&mut runner(&mut s), Some(&BED), None).unwrap();
+        // 25 rows across the 25.4 mm image; the rectangle on the same layer is left out.
+        assert_eq!(g.contours, 25);
+        assert!(d.warnings.iter().any(|w| w.contains("paths on Image layers")), "{:?}", d.warnings);
+        assert!(g.gcode.contains("M4 S500"), "the darkest pixels at full power");
     }
 
     /// The section drawn headless: without a machine it says so; with one, Generate and the

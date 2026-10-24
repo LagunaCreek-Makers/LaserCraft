@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::raster::Dither;
 use serde_json::Value;
 use vectorcraft_doc::{Document, NodeId};
 
@@ -17,23 +19,43 @@ pub const MAX_SPEED_MM_MIN: f64 = 100_000.0;
 /// Most passes a layer may ask for.
 pub const MAX_PASSES: u32 = 100;
 
-/// How a layer's art is cut. Only Line (cut along the path) exists for now; Fill and Image come
-/// later.
+/// Finest and coarsest Fill line interval (mm).
+pub const INTERVAL_RANGE: std::ops::RangeInclusive<f64> = 0.01..=10.0;
+/// Longest Fill overscan (mm).
+pub const MAX_OVERSCAN_MM: f64 = 50.0;
+
+/// How a layer's art is cut.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LaserMode {
+    /// Cut along the paths.
     #[default]
     Line,
+    /// Engrave the inside of closed shapes with parallel scan lines (their fill rule decides
+    /// what is inside: holes stay empty).
+    Fill,
+    /// Engrave placed images line by line, darkness as power (dithered or grey levels).
+    Image,
 }
 
 impl LaserMode {
+    pub const ALL: [LaserMode; 3] = [LaserMode::Line, LaserMode::Fill, LaserMode::Image];
     pub fn id(self) -> &'static str {
         match self {
             LaserMode::Line => "line",
+            LaserMode::Fill => "fill",
+            LaserMode::Image => "image",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            LaserMode::Line => "Line",
+            LaserMode::Fill => "Fill",
+            LaserMode::Image => "Image",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
-        s.eq_ignore_ascii_case("line").then_some(LaserMode::Line)
+        Self::ALL.into_iter().find(|m| m.id().eq_ignore_ascii_case(s.trim()))
     }
 }
 
@@ -52,11 +74,47 @@ pub struct LayerSettings {
     pub passes: u32,
     /// Disabled layers are left out of the job.
     pub enabled: bool,
+    /// Fill: the distance between scan lines (mm).
+    #[serde(rename = "interval")]
+    pub interval_mm: f64,
+    /// Fill: the scan lines' angle, counter-clockwise degrees from the bed's x axis (0:
+    /// horizontal lines, 90: vertical).
+    #[serde(rename = "angle")]
+    pub angle_deg: f64,
+    /// Fill: every other scan line runs back (else all run the same way, with a travel between).
+    pub bidirectional: bool,
+    /// Fill: the head runs on this far past each end of a scan line with the laser off, so it
+    /// is at speed while it burns (mm; shortened at the bed's edges).
+    #[serde(rename = "overscan")]
+    pub overscan_mm: f64,
+    /// Fill: scan again at right angles to the first lines.
+    pub crosshatch: bool,
+    /// Image: how grey levels become power.
+    pub dither: Dither,
+    /// Image: the power of the lightest grey that burns (Grayscale; `power` is the darkest's).
+    #[serde(rename = "minPower")]
+    pub min_power_percent: f64,
+    /// Image: burn the light parts instead of the dark ones.
+    pub negative: bool,
 }
 
 impl Default for LayerSettings {
     fn default() -> Self {
-        Self { mode: LaserMode::Line, speed_mm_min: 1000.0, power_percent: 20.0, passes: 1, enabled: true }
+        Self {
+            mode: LaserMode::Line,
+            speed_mm_min: 1000.0,
+            power_percent: 20.0,
+            passes: 1,
+            enabled: true,
+            interval_mm: 0.1,
+            angle_deg: 0.0,
+            bidirectional: true,
+            overscan_mm: 0.0,
+            crosshatch: false,
+            dither: Dither::FloydSteinberg,
+            min_power_percent: 0.0,
+            negative: false,
+        }
     }
 }
 
@@ -71,6 +129,18 @@ impl LayerSettings {
         }
         if !(1..=MAX_PASSES).contains(&self.passes) {
             return Err(format!("passes must be from 1 to {MAX_PASSES}, not {}", self.passes));
+        }
+        if !(self.interval_mm.is_finite() && INTERVAL_RANGE.contains(&self.interval_mm)) {
+            return Err(format!("interval must be from {} to {} mm, not {}", INTERVAL_RANGE.start(), INTERVAL_RANGE.end(), self.interval_mm));
+        }
+        if !(self.angle_deg.is_finite() && (-360.0..=360.0).contains(&self.angle_deg)) {
+            return Err(format!("angle must be from -360 to 360 degrees, not {}", self.angle_deg));
+        }
+        if !(self.min_power_percent.is_finite() && (0.0..=self.power_percent).contains(&self.min_power_percent)) {
+            return Err(format!("minimum power must be from 0 to the power ({} %), not {}", self.power_percent, self.min_power_percent));
+        }
+        if !(self.overscan_mm.is_finite() && (0.0..=MAX_OVERSCAN_MM).contains(&self.overscan_mm)) {
+            return Err(format!("overscan must be from 0 to {MAX_OVERSCAN_MM} mm, not {}", self.overscan_mm));
         }
         Ok(())
     }
