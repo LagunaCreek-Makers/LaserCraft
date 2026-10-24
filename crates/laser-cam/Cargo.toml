@@ -17,3 +17,7 @@ lasercraft-core = { path = "../lasercraft-core" }
 kurbo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Test images (PNG) built in code.
+image = { workspace = true }

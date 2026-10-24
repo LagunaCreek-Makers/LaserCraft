@@ -3,7 +3,7 @@
 //! and read the per-layer cut settings, which save with the document.
 
 use lasercraft_cam::machine::MAX_BED_MM;
-use lasercraft_cam::{JobOptions, LaserMode, LayerSettings, Origin};
+use lasercraft_cam::{Dither, JobOptions, LaserMode, LayerSettings, Origin};
 use lasercraft_core::{Machine, PlanError};
 use serde_json::{Value, json};
 
@@ -70,7 +70,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Laser Layer Settings",
             [],
             None,
-            "{layer: layer id, speed?: mm/min (default 1000), power?: 0–100 % (default 20), passes?: 1–100 (default 1), enabled?: true, mode?: line (cut along the paths, default)|fill (engrave inside closed shapes with scan lines), interval?: fill line spacing (0.01–10 mm; default 0.1), angle?: fill line angle (degrees counter-clockwise; default 0: horizontal), bidirectional?: true (every other fill line runs back), overscan?: 0–50 mm the head runs past each fill line at power 0 (default 0; shortened at the bed's edges), crosshatch?: false (fill again at right angles), clear?: false (back to the defaults)} → {layer, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch}. Values not given keep the layer's current ones. Saved with the document",
+            "{layer: layer id, speed?: mm/min (default 1000), power?: 0–100 % (default 20), passes?: 1–100 (default 1), enabled?: true, mode?: line (cut along the paths, default)|fill (engrave inside closed shapes with scan lines)|image (engrave placed images line by line), interval?: fill or image line spacing (0.01–10 mm; default 0.1), angle?: fill line angle (degrees counter-clockwise; default 0: horizontal), bidirectional?: true (every other fill line runs back), overscan?: 0–50 mm the head runs past each fill line at power 0 (default 0; shortened at the bed's edges), crosshatch?: false (fill again at right angles), dither?: image grey levels: floydSteinberg (default)|jarvis|ordered|threshold|grayscale (power from darkness between minPower and power), minPower?: image power of the lightest grey burnt (0 to power; default 0), negative?: false (image: burn the light parts), clear?: false (back to the defaults)} → {layer, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, dither, minPower, negative}. Values not given keep the layer's current ones. Saved with the document",
             has_doc,
             set_layer
         ),
@@ -79,7 +79,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Laser Layers",
             [],
             None,
-            "{} → {layers: [{layer, name, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, custom}]}: every layer (sublayers too) with the laser settings it cuts with, top-level layers bottom first",
+            "{} → {layers: [{layer, name, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, dither, minPower, negative, custom}]}: every layer (sublayers too) with the laser settings it cuts with, top-level layers bottom first",
             has_doc,
             list_layers
         ),
@@ -183,11 +183,14 @@ fn settings_json(id: NodeId, s: &LayerSettings) -> Value {
         "bidirectional": s.bidirectional,
         "overscan": s.overscan_mm,
         "crosshatch": s.crosshatch,
+        "dither": s.dither.id(),
+        "minPower": s.min_power_percent,
+        "negative": s.negative,
     })
 }
 
 fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
-    check_numbers(p, &["speed", "power", "passes", "interval", "angle", "overscan"], SET)?;
+    check_numbers(p, &["speed", "power", "passes", "interval", "angle", "overscan", "minPower"], SET)?;
     let layer = p.get("layer").ok_or_else(|| bad(SET, "missing `layer` (a layer id)"))?;
     let id = checked_id(s, layer, SET)?;
     let doc = &s.doc()?.doc;
@@ -204,7 +207,9 @@ fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(n) = p.get("passes").filter(|n| !n.is_null()) {
             v.passes = n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(SET, "passes must be a whole number"))?;
         }
-        for (key, field) in [("enabled", &mut v.enabled), ("bidirectional", &mut v.bidirectional), ("crosshatch", &mut v.crosshatch)] {
+        for (key, field) in
+            [("enabled", &mut v.enabled), ("bidirectional", &mut v.bidirectional), ("crosshatch", &mut v.crosshatch), ("negative", &mut v.negative)]
+        {
             match p.get(key) {
                 None | Some(Value::Null) => {}
                 Some(Value::Bool(b)) => *field = *b,
@@ -214,8 +219,12 @@ fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
         v.interval_mm = f64_or(p, "interval", v.interval_mm);
         v.angle_deg = f64_or(p, "angle", v.angle_deg);
         v.overscan_mm = f64_or(p, "overscan", v.overscan_mm);
+        v.min_power_percent = f64_or(p, "minPower", v.min_power_percent);
+        if let Some(d) = str_param(p, "dither") {
+            v.dither = Dither::parse(d).ok_or_else(|| bad(SET, format!("dither `{d}`: threshold, ordered, floydSteinberg, jarvis or grayscale")))?;
+        }
         if let Some(m) = str_param(p, "mode") {
-            v.mode = LaserMode::parse(m).ok_or_else(|| bad(SET, format!("mode `{m}`: line or fill")))?;
+            v.mode = LaserMode::parse(m).ok_or_else(|| bad(SET, format!("mode `{m}`: line, fill or image")))?;
         }
         v.validate().map_err(|e| bad(SET, e))?;
         Some(v)
@@ -391,6 +400,29 @@ mod tests {
             p["layer"] = json!(l);
             assert!(s.execute(SET, &p).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn image_layers_take_their_settings() {
+        let mut s = session();
+        let l = layer(&s);
+        let r = s
+            .execute(SET, &json!({"layer": l, "mode": "image", "dither": "jarvis", "power": 60, "minPower": 15, "negative": true, "interval": 0.2}))
+            .unwrap();
+        assert_eq!(
+            (r["mode"].as_str(), r["dither"].as_str(), r["minPower"].as_f64(), r["negative"].as_bool()),
+            (Some("image"), Some("jarvis"), Some(15.0), Some(true))
+        );
+        assert_eq!(s.execute("laser.layers", &json!({})).unwrap()["layers"][0]["dither"], "jarvis");
+        for bad in [json!({"dither": "halftone"}), json!({"minPower": 90}), json!({"negative": 1})] {
+            let mut p = bad.clone();
+            p["layer"] = json!(l);
+            assert!(s.execute(SET, &p).is_err(), "{bad}");
+        }
+        // No image on the Image layer: nothing to cut.
+        s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap();
+        let e = export(&mut s, json!({})).unwrap_err().to_string();
+        assert!(e.contains("nothing to cut") && e.contains("Image layers"), "{e}");
     }
 
     #[test]

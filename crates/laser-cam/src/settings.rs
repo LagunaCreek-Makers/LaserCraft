@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::raster::Dither;
 use serde_json::Value;
 use vectorcraft_doc::{Document, NodeId};
 
@@ -32,20 +34,24 @@ pub enum LaserMode {
     /// Engrave the inside of closed shapes with parallel scan lines (their fill rule decides
     /// what is inside: holes stay empty).
     Fill,
+    /// Engrave placed images line by line, darkness as power (dithered or grey levels).
+    Image,
 }
 
 impl LaserMode {
-    pub const ALL: [LaserMode; 2] = [LaserMode::Line, LaserMode::Fill];
+    pub const ALL: [LaserMode; 3] = [LaserMode::Line, LaserMode::Fill, LaserMode::Image];
     pub fn id(self) -> &'static str {
         match self {
             LaserMode::Line => "line",
             LaserMode::Fill => "fill",
+            LaserMode::Image => "image",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             LaserMode::Line => "Line",
             LaserMode::Fill => "Fill",
+            LaserMode::Image => "Image",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -83,6 +89,13 @@ pub struct LayerSettings {
     pub overscan_mm: f64,
     /// Fill: scan again at right angles to the first lines.
     pub crosshatch: bool,
+    /// Image: how grey levels become power.
+    pub dither: Dither,
+    /// Image: the power of the lightest grey that burns (Grayscale; `power` is the darkest's).
+    #[serde(rename = "minPower")]
+    pub min_power_percent: f64,
+    /// Image: burn the light parts instead of the dark ones.
+    pub negative: bool,
 }
 
 impl Default for LayerSettings {
@@ -98,6 +111,9 @@ impl Default for LayerSettings {
             bidirectional: true,
             overscan_mm: 0.0,
             crosshatch: false,
+            dither: Dither::FloydSteinberg,
+            min_power_percent: 0.0,
+            negative: false,
         }
     }
 }
@@ -119,6 +135,9 @@ impl LayerSettings {
         }
         if !(self.angle_deg.is_finite() && (-360.0..=360.0).contains(&self.angle_deg)) {
             return Err(format!("angle must be from -360 to 360 degrees, not {}", self.angle_deg));
+        }
+        if !(self.min_power_percent.is_finite() && (0.0..=self.power_percent).contains(&self.min_power_percent)) {
+            return Err(format!("minimum power must be from 0 to the power ({} %), not {}", self.power_percent, self.min_power_percent));
         }
         if !(self.overscan_mm.is_finite() && (0.0..=MAX_OVERSCAN_MM).contains(&self.overscan_mm)) {
             return Err(format!("overscan must be from 0 to {MAX_OVERSCAN_MM} mm, not {}", self.overscan_mm));

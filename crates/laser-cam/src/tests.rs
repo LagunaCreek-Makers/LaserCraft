@@ -486,3 +486,128 @@ fn fill_settings_are_checked_and_stored() {
     assert_eq!((read.mode, read.interval_mm, read.speed_mm_min), (LaserMode::Line, 0.1, 500.0));
     assert_eq!(LaserMode::parse("FILL"), Some(LaserMode::Fill));
 }
+
+/// A `w` × `h` grey ramp PNG, white on the left to black on the right.
+fn ramp_png(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbaImage::from_fn(w, h, |x, _| {
+        let v = 255 - (x * 255 / (w - 1).max(1)) as u8;
+        image::Rgba([v, v, v, 255])
+    });
+    let mut out = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+    out
+}
+
+/// A document with a ramp image of `w` × `h` pixels placed by `xf` (pixel → points).
+fn image_doc(w: u32, h: u32, xf: Affine) -> Document {
+    let mut d = doc();
+    d.images.insert("ramp".into(), vectorcraft_doc::ImageBlob::png(ramp_png(w, h)));
+    let id = d.alloc_id();
+    let im = vectorcraft_doc::ImageObject { key: "ramp".into(), width: w, height: h, xf, link: None, placement: Default::default() };
+    add(&mut d, Node::new(id, vectorcraft_doc::NodeKind::Image(Box::new(im))));
+    d
+}
+
+fn image_layer(s: LayerSettings) -> JobOptions {
+    JobOptions { default_layer: LayerSettings { mode: LaserMode::Image, ..s }, ..JobOptions::default() }
+}
+
+#[test]
+fn image_mode_engraves_rows_with_power_from_darkness() {
+    // 64 × 32 px placed as 1 × 0.5 in, 1 in from the top-left of the board.
+    let d = image_doc(64, 32, Affine::translate((72.0, 72.0)) * Affine::scale(72.0 / 64.0));
+    let s = LayerSettings {
+        interval_mm: 1.0,
+        dither: Dither::Grayscale,
+        power_percent: 80.0,
+        min_power_percent: 10.0,
+        bidirectional: false,
+        ..LayerSettings::default()
+    };
+    let j = document_to_job(&d, &image_layer(s)).unwrap();
+    assert!(j.warnings.is_empty(), "{:?}", j.warnings);
+    // 12.7 mm tall at 1 mm: 13 rows.
+    assert_eq!(j.contours, 13);
+    let mut powers = vec![];
+    for op in &j.job.operations {
+        if let Operation::Cut { to, power_percent, .. } = op {
+            assert!((25.4 - 1e-6..=50.8 + 1e-6).contains(&to.x_mm), "inside the image: {}", to.x_mm);
+            if *power_percent > 0.0 {
+                powers.push(*power_percent);
+            }
+        }
+    }
+    // Grey levels between the minimum and the maximum, the darkest at the maximum.
+    assert!(powers.iter().all(|p| (10.0..=80.0).contains(p)), "{powers:?}");
+    assert!(powers.iter().any(|p| (*p - 80.0).abs() < 1.0));
+    assert!(powers.iter().any(|p| *p < 40.0));
+    // Each row runs left to right (bidirectional off), darker (more power) to the right.
+    assert!(j.job.to_grbl(lasercraft_core::Machine { width_mm: 300.0, height_mm: 300.0, max_s: 1000 }).is_ok());
+}
+
+#[test]
+fn image_dithering_negative_and_overscan() {
+    let d = image_doc(64, 32, Affine::translate((72.0, 72.0)) * Affine::scale(72.0 / 64.0));
+    let base = LayerSettings { interval_mm: 0.5, power_percent: 50.0, ..LayerSettings::default() };
+    let burnt = |s: LayerSettings| -> f64 { burns(&document_to_job(&d, &image_layer(s)).unwrap()).iter().map(|(a, b)| (a.0 - b.0).abs()).sum() };
+    // Dithered: full power or none; a ramp burns about half its area.
+    let fs = document_to_job(&d, &image_layer(base)).unwrap();
+    assert!(fs.job.operations.iter().all(|o| !matches!(o, Operation::Cut { power_percent, .. } if *power_percent > 0.0 && *power_percent != 50.0)));
+    let area = 25.4 * 25.4 / 2.0 / 0.5;
+    for dither in [Dither::Threshold, Dither::Ordered, Dither::FloydSteinberg, Dither::Jarvis] {
+        let b = burnt(LayerSettings { dither, ..base });
+        assert!((b / area - 0.5).abs() < 0.12, "{dither:?}: {}", b / area);
+    }
+    // Same settings, same job.
+    let a = document_to_job(&d, &image_layer(LayerSettings { dither: Dither::Jarvis, ..base })).unwrap();
+    let b = document_to_job(&d, &image_layer(LayerSettings { dither: Dither::Jarvis, ..base })).unwrap();
+    assert_eq!(format!("{:?}", a.job.operations), format!("{:?}", b.job.operations));
+    // Negative: the light half burns instead.
+    let neg = burns(&document_to_job(&d, &image_layer(LayerSettings { negative: true, dither: Dither::Threshold, ..base })).unwrap());
+    assert!(neg.iter().all(|(a, b)| a.0.max(b.0) <= 38.1 + 0.5), "the left (white) half, give or take a sample: {:?}", neg.first());
+    // Overscan at power 0, shortened at the bed edge with a warning.
+    let os = document_to_job(&d, &JobOptions { bed: Some((40.0, 300.0)), ..image_layer(LayerSettings { overscan_mm: 5.0, ..base }) }).unwrap();
+    assert!(os.warnings.iter().any(|w| w.contains("overscan")), "{:?}", os.warnings);
+}
+
+#[test]
+fn turned_images_are_engraved_along_their_rows() {
+    // Turned 90°: the image's rows run down the bed.
+    let d = image_doc(32, 32, Affine::translate((200.0, 72.0)) * Affine::rotate(std::f64::consts::FRAC_PI_2) * Affine::scale(72.0 / 32.0));
+    let j = document_to_job(&d, &image_layer(LayerSettings { interval_mm: 1.0, dither: Dither::Threshold, ..LayerSettings::default() })).unwrap();
+    let b = burns(&j);
+    assert!(!b.is_empty());
+    assert!(b.iter().all(|(a, b)| (a.0 - b.0).abs() < 1e-6), "vertical burns: {:?}", b.first());
+}
+
+#[test]
+fn images_off_image_layers_and_paths_on_them_are_warned_about() {
+    let mut d = image_doc(16, 16, Affine::scale(4.0));
+    let r = path(&mut d, shapes::rectangle(Rect::new(300.0, 300.0, 400.0, 400.0)));
+    add(&mut d, r);
+    let line = document_to_job(&d, &JobOptions::default()).unwrap();
+    assert!(line.warnings.iter().any(|w| w.contains("Image mode")), "{:?}", line.warnings);
+    let img = document_to_job(&d, &image_layer(LayerSettings::default())).unwrap();
+    assert!(img.warnings.iter().any(|w| w.contains("paths on Image layers")), "{:?}", img.warnings);
+    // A missing image blob is left out with a warning, not a failure.
+    d.images.clear();
+    let gone = document_to_job(&d, &image_layer(LayerSettings::default())).unwrap();
+    assert!(gone.warnings.iter().any(|w| w.contains("could not be read")), "{:?}", gone.warnings);
+}
+
+#[test]
+fn image_sample_counts_are_capped() {
+    // 2000 × 2000 px stretched over the whole 254 mm board at 0.01 mm: 25400² samples.
+    let d = image_doc(8, 8, Affine::scale(90.0));
+    let e = document_to_job(&d, &image_layer(LayerSettings { interval_mm: 0.01, ..LayerSettings::default() })).unwrap_err();
+    assert!(e.contains("too large"), "{e}");
+    // Settings: minimum power above the power is refused.
+    let mut d = doc();
+    let layer = d.layers[0].id;
+    let s = LayerSettings { mode: LaserMode::Image, power_percent: 30.0, min_power_percent: 40.0, ..LayerSettings::default() };
+    assert!(set_layer_settings(&mut d, layer, Some(s)).is_err());
+    let ok = LayerSettings { min_power_percent: 5.0, dither: Dither::Ordered, negative: true, ..s };
+    set_layer_settings(&mut d, layer, Some(ok)).unwrap();
+    let back: Document = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+    assert_eq!(layer_settings(&back).get(&layer), Some(&ok));
+}

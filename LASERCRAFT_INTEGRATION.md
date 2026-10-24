@@ -80,3 +80,16 @@ the line spacing (0.01–10 mm), `angle` turns the lines (0° horizontal, 90° v
 `overscan` (0–50 mm) runs the head on past each end of a line at power 0 (S0) so it burns at
 speed; overscan is shortened where it would leave the bed, with a warning. The dry run shows the
 overscan as travel.
+
+### Image mode
+
+A layer in **Image** mode (`laser.setLayer {mode: image, interval, dither, power, minPower,
+negative, bidirectional, overscan}`) engraves the images placed on it line by line; paths on it are
+left out (with a warning), as images on Line and Fill layers are. Each image is resampled at
+`interval` along its own rows and columns (a turned image is engraved along its turned rows), each
+sample the area average of the pixels under it; transparent pixels never burn. `dither` turns grey
+levels into power: `floydSteinberg` (default) or `jarvis` error diffusion, `ordered` (4 × 4 Bayer)
+or `threshold` burn at full power or not at all; `grayscale` sets each sample's power between
+`minPower` and `power` by its darkness. `negative` burns the light parts. Overscan runs at S0 and
+stops at the bed's edges. Images are capped at 16 million samples (40 000 along a side) at the
+chosen interval: a larger one asks for a larger interval instead of allocating it.

@@ -2296,6 +2296,7 @@ dependencies = [
 name = "lasercraft-cam"
 version = "0.13.1"
 dependencies = [
+ "image",
  "kurbo 0.13.1",
  "lasercraft-core",
  "serde",

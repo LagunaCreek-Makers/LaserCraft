@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use kurbo::PathEl;
 use vectorcraft_color::Paint;
-use vectorcraft_doc::{Document, Node, NodeId, NodeKind};
+use vectorcraft_doc::{Document, ImageBlob, Node, NodeId, NodeKind};
 use vectorcraft_geom::{Affine, BezPath, Point};
 
 use vectorcraft_geom::FillRule;
@@ -20,7 +20,9 @@ const MAX_NEST: u32 = 16;
 /// Most points one job may hold (a cap on what a damaged or huge file makes us allocate).
 pub(crate) const MAX_POINTS: usize = 20_000_000;
 
-pub(crate) const IMAGES: &str = "placed images are left out: Line mode cuts paths only";
+pub(crate) const IMAGES: &str = "placed images are left out of Line and Fill layers: put them on a layer in Image mode to engrave them";
+pub(crate) const PATHS_ON_IMAGE: &str = "paths on Image layers are left out: Image mode engraves placed images only";
+pub(crate) const UNREADABLE: &str = "an image could not be read and is left out";
 pub(crate) const TEXT: &str = "type is left out: outline it first (Type → Create Outlines)";
 pub(crate) const GRADIENTS: &str = "gradient paint is ignored: Line mode cuts the path's outline";
 pub(crate) const CLIPPING: &str = "clipping masks are not applied: the art they clip is cut whole, the clipping path is left out";
@@ -39,6 +41,16 @@ pub(crate) struct WalkedLayer {
     pub settings: LayerSettings,
     pub contours: Vec<Contour>,
     pub shapes: Vec<Shape>,
+    pub images: Vec<RasterImage>,
+}
+
+/// A placed image on an Image layer.
+pub(crate) struct RasterImage {
+    /// Pixel space (0..width, 0..height) → bed millimetres.
+    pub to_mm: Affine,
+    pub width: u32,
+    pub height: u32,
+    pub blob: ImageBlob,
 }
 
 /// What the walk found: the art of each settings layer, in paint order.
@@ -91,7 +103,7 @@ impl<'a> Walker<'a> {
         for l in &doc.layers {
             self.node(l, self.only.is_none());
         }
-        self.out.layers.retain(|l| l.settings.enabled && !(l.contours.is_empty() && l.shapes.is_empty()));
+        self.out.layers.retain(|l| l.settings.enabled && !(l.contours.is_empty() && l.shapes.is_empty() && l.images.is_empty()));
         self.out
     }
 
@@ -115,7 +127,7 @@ impl<'a> Walker<'a> {
                 // with its parent layer's (the defaults at the top).
                 if self.current.is_none() || self.settings.contains_key(&n.id) {
                     let s = self.settings.get(&n.id).copied().unwrap_or(self.default);
-                    self.out.layers.push(WalkedLayer { settings: s, contours: vec![], shapes: vec![] });
+                    self.out.layers.push(WalkedLayer { settings: s, contours: vec![], shapes: vec![], images: vec![] });
                     self.current = Some(self.out.layers.len() - 1);
                 }
                 self.children(children, *clip, chosen);
@@ -143,9 +155,9 @@ impl<'a> Walker<'a> {
                     self.warn(TEXT);
                 }
             }
-            NodeKind::Image(_) => {
+            NodeKind::Image(im) => {
                 if chosen {
-                    self.warn(IMAGES);
+                    self.image(im);
                 }
             }
             NodeKind::SymbolInstance { symbol, xf } => {
@@ -195,6 +207,24 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// A placed image: engraved on an Image layer, left out (with a warning) elsewhere.
+    fn image(&mut self, im: &vectorcraft_doc::ImageObject) {
+        let Some(layer) = self.current else { return };
+        let on_image_layer = self.out.layers.get(layer).is_some_and(|l| l.settings.mode == LaserMode::Image);
+        if !on_image_layer {
+            self.warn(IMAGES);
+            return;
+        }
+        let Some(blob) = self.doc.images.get(&im.key) else {
+            self.warn(UNREADABLE);
+            return;
+        };
+        let img = RasterImage { to_mm: self.to_mm * im.xf, width: im.width, height: im.height, blob: blob.clone() };
+        if let Some(l) = self.out.layers.get_mut(layer) {
+            l.images.push(img);
+        }
+    }
+
     fn note_paint(&mut self, n: &Node) {
         if n.appearance.items.iter().any(|i| matches!(i.paint(), Paint::Gradient(_))) {
             self.warn(GRADIENTS);
@@ -238,9 +268,13 @@ impl<'a> Walker<'a> {
             return;
         }
         self.points += n;
+        if self.out.layers.get(layer).is_some_and(|l| l.settings.mode == LaserMode::Image) {
+            self.warn(PATHS_ON_IMAGE);
+            return;
+        }
         if let Some(l) = self.out.layers.get_mut(layer) {
             match l.settings.mode {
-                LaserMode::Line => l.contours.extend(contours),
+                LaserMode::Line | LaserMode::Image => l.contours.extend(contours),
                 // A fill closes every outline.
                 LaserMode::Fill => l.shapes.push(Shape { polys: contours.into_iter().map(|c| c.points).collect(), rule }),
             }
