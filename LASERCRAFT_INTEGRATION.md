@@ -52,3 +52,16 @@ layer. From the command line, `--machine` reads a profile:
 ```bash
 vectorcraft-cli run --in part.vectorcraft --machine "GRBL 300 x 200" --cmd laser.exportGcode --params '{"path": "part.gcode"}'
 ```
+
+### The laser panel and the document
+
+The laser panel's **Document → laser job** section makes the job from the open document through
+`laser.exportGcode`, for the loaded machine profile's bed, maximum S and origin. Until a profile is
+loaded (Saved machines → Load machine) it shows the command's "no machine bed size" error instead
+of guessing a size. **Generate from document** sends the job to the dry run (with the machine's
+air-assist and accessory hooks, like the panel's other jobs); **Export G-code…** saves the
+document's job to a file and lists what was left out (images, type, gradients, clipping) or why
+it was refused (art off the bed). **Document layers** lists the document's layers
+(`laser.layers`) and sets their speed, power, passes and on/off with `laser.setLayer` (one undoable
+step each). The dry run draws the bed with the machine's origin corner. The pasted-SVG section is
+kept as legacy: it ignores the origin.

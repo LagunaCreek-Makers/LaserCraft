@@ -5,6 +5,7 @@ use crate::accessory_macros::{MacroAction, MacroConfig, MacroEvent, MacroRule};
 use crate::air_assist::{AirConfig, AirMode};
 use crate::grbl_monitor::{self, Event, GrblStatus, Monitor};
 use crate::grbl_stream::Progress;
+use crate::laser_doc::{self, Bed, DocExport};
 use crate::laser_sim;
 use crate::laser_tests::{self, TestKind, TestResult, TestSettings};
 use crate::macro_routines::{Context, EventBinding, Routine, RoutineDatabase, Step};
@@ -68,6 +69,11 @@ pub struct LaserPanel {
     max_s: u32,
     /// The corner the machine counts from (saved in its profile as `origin`).
     machine_origin: Origin,
+    /// The name of the machine profile loaded (Load machine, or saved): jobs from the document
+    /// are made for its bed only.
+    loaded_profile: Option<String>,
+    /// The job made from the document and its layers' settings.
+    doc_export: DocExport,
     message: String,
     svg_source: String,
     generated_gcode: String,
@@ -134,6 +140,8 @@ impl Default for LaserPanel {
             machine_height: 200.0,
             max_s: 1000,
             machine_origin: Origin::BottomLeft,
+            loaded_profile: None,
+            doc_export: DocExport::default(),
             message: "Offline mode — no laser is connected".into(),
             svg_source: String::new(),
             generated_gcode: String::new(),
@@ -242,6 +250,7 @@ impl LaserPanel {
             self.controller = p["controller"].as_str().unwrap_or("GRBL").to_owned();
             // Profiles saved before `origin` existed get their controller's usual corner.
             self.machine_origin = p["origin"].as_str().and_then(Origin::parse).unwrap_or_else(|| Origin::default_for(&self.controller));
+            self.loaded_profile = Some(p["name"].as_str().unwrap_or("Unnamed").to_owned());
             self.connection_port = p["port"].as_str().unwrap_or("").to_owned();
             self.connection_baud = p["baud"].as_u64().unwrap_or(115200).clamp(1200, 1000000) as u32;
             self.air_config = serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
@@ -278,7 +287,56 @@ impl LaserPanel {
             l.air = serde_json::from_value(p["air_assist"].clone()).unwrap_or_default();
         }
     }
-    pub fn show(&mut self, ctx: &egui::Context) {
+    /// The loaded machine's bed, which jobs from the document are made for (`None`: no machine
+    /// profile loaded yet, so none is guessed).
+    fn bed(&self) -> Option<Bed> {
+        self.loaded_profile.as_ref().map(|_| Bed {
+            width_mm: self.machine_width,
+            height_mm: self.machine_height,
+            max_s: self.max_s,
+            origin: self.machine_origin,
+        })
+    }
+    /// The document section, and what it asks for: a job from the document goes to the dry run
+    /// (with the machine's air assist and accessory hooks, as the panel's other jobs), and Export
+    /// G-code asks where to save.
+    fn document_section(&mut self, ui: &mut egui::Ui, run: &mut laser_doc::Run) {
+        let bed = self.bed();
+        let name = self.loaded_profile.clone().unwrap_or_default();
+        match self.doc_export.ui(ui, run, bed.as_ref(), &name) {
+            Some(laser_doc::Action::Generated(g)) => self.take_document_job(g.gcode),
+            Some(laser_doc::Action::ChooseExportPath) => {
+                if bed.is_none() {
+                    // No machine: the command says so (nothing to save).
+                    let _ = self.doc_export.generate(run, None, None);
+                    return;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["gcode", "nc", "gc"]).set_file_name("job.gcode").save_file()
+                    && let Some(path) = path.to_str()
+                    && let Some(g) = self.doc_export.generate(run, bed.as_ref(), Some(path))
+                {
+                    self.take_document_job(g.gcode);
+                }
+            }
+            None => {}
+        }
+    }
+    fn take_document_job(&mut self, gcode: String) {
+        match self.air_config.apply(&gcode, AirMode::Inherit).and_then(|code| self.accessory_config.apply(&code)) {
+            Ok(code) => {
+                self.preview = None;
+                self.generated_gcode = code.clone();
+                self.sim_source = code;
+                self.sim_step = 0;
+                self.sim_time = 0.0;
+                self.sim_playing = false;
+                self.message = "Job made from the document; inspect it in the dry run. Not sent to the controller.".into();
+            }
+            Err(e) => self.message = e,
+        }
+    }
+    pub fn show(&mut self, ctx: &egui::Context, run: &mut laser_doc::Run) {
         if !self.open {
             return;
         }
@@ -394,7 +452,9 @@ impl LaserPanel {
         }
         let mut open = self.open;
         egui::Window::new("LaserCraft | Laser Operations").open(&mut open).default_width(350.0).resizable(true).show(ctx,|ui|{
-   ui.horizontal(|ui| {ui.heading("Cuts / Layers"); if ui.button("+ Add").clicked(){let idx=self.layers.len();self.layers.push(LaserLayer::new(&format!("C{idx:02}"),Color32::LIGHT_BLUE));self.selected=idx;}});
+   egui::CollapsingHeader::new("Document → laser job").default_open(true).show(ui,|ui|self.document_section(ui,run));
+   ui.separator();
+   ui.horizontal(|ui| {ui.heading("Panel cut layers"); if ui.button("+ Add").clicked(){let idx=self.layers.len();self.layers.push(LaserLayer::new(&format!("C{idx:02}"),Color32::LIGHT_BLUE));self.selected=idx;}});
    egui::ScrollArea::vertical().max_height(190.0).show(ui,|ui|{
     for (i,layer) in self.layers.iter_mut().enumerate(){ui.horizontal(|ui|{ui.checkbox(&mut layer.enabled,"");let (rect,_)=ui.allocate_exact_size(egui::vec2(16.0,16.0),egui::Sense::hover());ui.painter().rect_filled(rect,2.0,layer.color);if ui.selectable_label(self.selected==i,&layer.name).clicked(){self.selected=i;}ui.label(layer.mode.label());});}
    });
@@ -432,6 +492,7 @@ impl LaserPanel {
     if ui.button("Save current machine as new profile").clicked(){
      self.profiles.push(json!({"name":format!("{} machine {}",self.controller,self.profiles.len()+1),"controller":self.controller,"width_mm":self.machine_width,"height_mm":self.machine_height,"max_s":self.max_s,"origin":self.machine_origin.id(),"port":self.connection_port,"baud":self.connection_baud,"air_assist":self.air_config,"accessories":self.accessory_config}));
      self.active_profile=self.profiles.len()-1;
+     self.loaded_profile=self.profiles.last().and_then(|p|p["name"].as_str()).map(str::to_owned);
      self.message=match self.save_profiles(){Ok(())=>"Machine profile saved".into(),Err(e)=>format!("Save failed: {e}")};
     }
     ui.horizontal(|ui|{
@@ -878,8 +939,8 @@ impl LaserPanel {
     }
    });
    ui.separator();
-   ui.collapsing("SVG artwork → laser toolpaths (offline)",|ui|{
-    ui.small("Paste SVG markup exported from VectorCraft. Straight paths, cubic/quadratic curves, circles, ellipses, lines, rectangles and polygons supported; transforms and arcs are rejected rather than silently cut incorrectly. Coordinates must be in mm.");
+   ui.collapsing("Legacy | Pasted SVG → laser toolpaths (offline)",|ui|{
+    ui.small("Legacy: use Document → laser job instead. This path ignores the machine's origin (SVG coordinates are taken as machine millimetres). Paste SVG markup exported from VectorCraft. Straight paths, cubic/quadratic curves, circles, ellipses, lines, rectangles and polygons supported; transforms and arcs are rejected rather than silently cut incorrectly. Coordinates must be in mm.");
     ui.checkbox(&mut self.color_mapping,"Match SVG stroke colors to operation layers (hex RGB)");
     ui.add(egui::TextEdit::multiline(&mut self.svg_source).desired_rows(5).hint_text("<svg>...</svg>"));
     if ui.button("Generate GRBL from SVG").clicked(){
@@ -955,8 +1016,10 @@ impl LaserPanel {
      let center=rect.center()+self.sim_pan;
      let sx=rect.width()/self.machine_width.max(1.0) as f32*self.sim_zoom;
      let sy=rect.height()/self.machine_height.max(1.0) as f32*self.sim_zoom;
-     let project=|x:f64,y:f64|egui::pos2(center.x+(x as f32-self.machine_width as f32/2.0)*sx,center.y-(y as f32-self.machine_height as f32/2.0)*sy);
-     painter.rect_stroke(egui::Rect::from_two_pos(project(0.0,0.0),project(self.machine_width,self.machine_height)),0.0,egui::Stroke::new(1.0,Color32::GRAY),egui::StrokeKind::Inside);
+     // Seen from above with the front edge at the bottom: the machine's 0, 0 sits at its origin corner.
+     let (bed_size,origin)=((self.machine_width,self.machine_height),self.machine_origin);
+     let project=|x:f64,y:f64|laser_doc::bed_to_screen(center,(sx,sy),bed_size,origin,x,y);
+     painter.rect_stroke(laser_doc::bed_rect(center,(sx,sy),bed_size,origin),0.0,egui::Stroke::new(1.0,Color32::GRAY),egui::StrokeKind::Inside);
      let mut previous=(0.0,0.0);
      let mut elapsed=0.0;
      for step in &sim.steps {
@@ -1115,5 +1178,32 @@ pub(crate) fn edit_condition(ui: &mut egui::Ui, expr: &mut crate::macro_routines
         }
         Expr::Not(x) => edit_condition(ui, x, depth + 1),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Jobs from the document are made for a loaded machine's bed only: none is guessed before.
+    #[test]
+    fn no_bed_until_a_machine_profile_is_loaded() {
+        let mut p = LaserPanel { profiles: vec![], loaded_profile: None, ..LaserPanel::default() };
+        assert_eq!(p.bed(), None);
+        p.profiles = vec![json!({"name": "Shop CO2", "controller": "Ruida", "width_mm": 600.0, "height_mm": 400.0, "max_s": 1000})];
+        p.active_profile = 0;
+        p.apply_machine();
+        assert_eq!(p.loaded_profile.as_deref(), Some("Shop CO2"));
+        assert_eq!(p.bed(), Some(Bed { width_mm: 600.0, height_mm: 400.0, max_s: 1000, origin: Origin::TopRight }));
+    }
+
+    /// A job from the document goes to the dry run, with the machine's (default, empty) hooks.
+    #[test]
+    fn a_document_job_goes_to_the_dry_run() {
+        let mut p = LaserPanel::default();
+        p.take_document_job("G21\nG90\nM5\nG0 X1 Y1\nM5\n".into());
+        assert!(p.generated_gcode.contains("G0 X1 Y1"));
+        assert_eq!(p.sim_source, p.generated_gcode);
+        assert!(p.preview.is_none());
     }
 }
