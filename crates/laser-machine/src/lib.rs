@@ -19,3 +19,13 @@ pub trait Transport {
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()>;
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
 }
+
+/// A boxed link (a serial port or a simulator chosen at run time) is a link.
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        (**self).write_all(bytes)
+    }
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (**self).read(buf)
+    }
+}

@@ -141,3 +141,14 @@ section), else 6000 mm/min and 1000 mm/s². `laser.exportGcode` returns
 `estimate: {seconds, burnMm, travelMm, moves}` (params `maxRate`, `acceleration`; `vectorcraft-cli
 run --machine` passes the profile's), the panel shows it after Generate/Export and in the dry run.
 It is an estimate: the controller's buffer and the serial link make the real time somewhat longer.
+
+### Automation and real machines
+
+The control channel's `laser.machine.*` methods reach the laser panel's machine
+(`docs/control-protocol.md`); MCP has no machine tools. The rule (from the project owner): **machine motion is panel-only.** On a real machine (a
+serial port), automation may only `connect`, `disconnect`, read `status`, `readSettings` (`$$`,
+read-only), `hold` and `stop`. `resume`, `jog`, `home`, `unlock` and `start` are refused with
+"machine motion is panel-only", and nothing (no param, no setting) turns them on: the desktop app
+decides from how the link was opened (the serial port or the built-in simulator), never from the
+request. On the simulator (`connect {simulator: true}`) automation may drive everything, so
+tests and CI cover the whole job lifecycle.

@@ -84,6 +84,9 @@ use vectorcraft_ui_egui::{ClipboardProbeFactory, FilePick, Services, Vectorcraft
 
 struct App {
     laser_panel: laser_panel::LaserPanel,
+    /// Control requests as they arrive, and where those that aren't the laser machine's go.
+    machine_requests:
+        Option<(std::sync::mpsc::Receiver<vectorcraft_ui_egui::ControlRequest>, std::sync::mpsc::Sender<vectorcraft_ui_egui::ControlRequest>)>,
     camera_overlay: camera_overlay::CameraOverlay,
     app: VectorcraftApp,
     /// Reported by wgpu when the window's graphics device is lost (a driver reset).
@@ -97,6 +100,26 @@ struct App {
 }
 
 impl App {
+    /// Answers the control channel's `laser.machine.*` requests from the laser panel (which keeps
+    /// machine motion panel-only on a real machine) and passes the others on to the editor.
+    fn route_machine_requests(&mut self) {
+        let Some((rx, to_editor)) = &self.machine_requests else { return };
+        for req in rx.try_iter().take(64) {
+            if !req.method.starts_with("laser.machine.") {
+                let _ = to_editor.send(req);
+                continue;
+            }
+            if !req.claim() {
+                continue;
+            }
+            let reply = match self.laser_panel.automation(&req.method, &req.params) {
+                Ok(v) => serde_json::json!({"ok": true, "result": v}),
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
+            };
+            let _ = req.reply.send(reply);
+        }
+    }
+
     /// The LaserCraft windows: the laser panel (acting on the document through commands) and the
     /// camera tools.
     fn laser_windows(&mut self, ui: &mut egui::Ui) {
@@ -145,6 +168,7 @@ impl eframe::App for App {
             let inset = mac_window::center_buttons(frame, ui.ctx().zoom_factor(), bar);
             self.app.titlebar_inset = inset.unwrap_or(mac_window::DEFAULT_INSET);
         }
+        self.route_machine_requests();
         file_access::unconfined(|| self.app.ui(ui));
         // The app binds its font families (window titles and headings use its semibold) as its
         // first frame ends: until then drawing a LaserCraft window panics, so they wait a frame.
@@ -1004,9 +1028,13 @@ fn main() -> std::process::ExitCode {
                     app.graphics_adapter = Some("OpenGL (Windows 7 compatibility)".into());
                 }
                 app.custom_titlebar = custom_titlebar;
+                let mut machine_requests = None;
                 if let Some(port) = control_port {
                     let rx = control_server::start(port, cc.egui_ctx.clone());
-                    app = app.with_control(rx).with_automation_roots(roots.clone());
+                    // The laser machine's requests are the laser panel's; the rest go on to the editor.
+                    let (to_editor, editor_rx) = std::sync::mpsc::channel();
+                    machine_requests = Some((rx, to_editor));
+                    app = app.with_control(editor_rx).with_automation_roots(roots.clone());
                     if let Some(roots) = &roots {
                         // Everywhere the app doesn't say whose work it is (worker threads), the
                         // roots hold: unconfined is only what the person at the keyboard does.
@@ -1033,6 +1061,7 @@ fn main() -> std::process::ExitCode {
                 Ok(Box::new(App {
                     app,
                     laser_panel: laser_panel::LaserPanel::default(),
+                    machine_requests,
                     camera_overlay: camera_overlay::CameraOverlay::default(),
                     graphics_loss,
                     graphics_lost: false,
