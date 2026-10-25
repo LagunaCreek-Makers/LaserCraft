@@ -1,0 +1,11 @@
+[package]
+name = "lasercraft-machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LaserCraft machine control: the GRBL protocol, job streaming and a simulator, over any transport (no I/O of its own)"
+
+[lints]
+workspace = true
+
+[dependencies]
