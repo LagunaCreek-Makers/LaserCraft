@@ -152,3 +152,18 @@ read-only), `hold` and `stop`. `resume`, `jog`, `home`, `unlock` and `start` are
 decides from how the link was opened (the serial port or the built-in simulator), never from the
 request. On the simulator (`connect {simulator: true}`) automation may drive everything, so
 tests and CI cover the whole job lifecycle.
+
+### The panel's Machine section
+
+The laser panel's **Machine** section (under Document → laser job) is the one place machine
+motion and jobs start. It connects a serial port (Find ports, Connect) or the built-in
+**Simulator**, shows the state, position and alarm (in words), and has **Hold**, **Resume** and
+**STOP** (feed hold, then a soft reset once halted) whenever connected. With **Motion enabled**
+ticked (and no job running): **Unlock** (`$X`), **Home** (`$H`), a jog pad (X/Y, 0.1–10 mm at
+1–1000 mm/min, Idle only), and **Frame**, which traces the generated job's bounding box with the
+laser off (M5, no S) at the chosen feed. **Start job…** opens a confirmation: the job's size and
+position, lines, highest power (% of the machine's maxS), estimated time, and any problem (off the
+bed, power above the machine's, refused lines), with a tick ("material, focus and air are set,
+the lid is closed, and someone stays with the machine") before Start is enabled; the job then
+goes through the accessory start-up and the controller's own preflight. A Console shows the
+controller's lines, `$I` and `$$`. The older "Phase 9/10" GRBL sections are replaced by it.

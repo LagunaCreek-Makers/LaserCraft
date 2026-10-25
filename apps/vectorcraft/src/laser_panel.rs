@@ -77,6 +77,11 @@ pub struct LaserPanel {
     loaded_profile: Option<String>,
     /// The job made from the document and its layers' settings.
     doc_export: DocExport,
+    /// The job waiting for the operator's confirmation (its summary and G-code), and their tick.
+    confirm_job: Option<(laser_doc::JobSummary, String)>,
+    confirm_checked: bool,
+    /// The feed (mm/min) a frame traces the job's box at.
+    frame_feed: f64,
     message: String,
     svg_source: String,
     generated_gcode: String,
@@ -146,6 +151,9 @@ impl Default for LaserPanel {
             machine_origin: Origin::BottomLeft,
             loaded_profile: None,
             doc_export: DocExport::default(),
+            confirm_job: None,
+            confirm_checked: false,
+            frame_feed: 3000.0,
             message: "Offline mode — no laser is connected".into(),
             svg_source: String::new(),
             generated_gcode: String::new(),
@@ -488,6 +496,241 @@ impl LaserPanel {
         })
     }
 
+    fn machine_motion(&self) -> lasercraft_machine::grbl::Motion {
+        lasercraft_machine::grbl::Motion { max_rate: [self.max_rate; 2], acceleration: [self.acceleration; 2], ..Default::default() }
+    }
+
+    /// The summary of `gcode` the operator confirms before it starts.
+    fn summarize(&self, gcode: &str) -> laser_doc::JobSummary {
+        laser_doc::job_summary(gcode, (self.machine_width, self.machine_height), self.max_s, &self.machine_motion())
+    }
+
+    /// The machine: connect (a serial port or the simulator), its state, hold / resume / STOP,
+    /// unlock, home, jog and frame (with motion enabled), and starting the job after the
+    /// operator confirms its summary. The only place machine motion and jobs start.
+    fn machine_section(&mut self, ui: &mut egui::Ui) {
+        let t = vectorcraft_ui_egui::theme::Tokens::get(ui.ctx());
+        let connected = self.monitor.is_some();
+        ui.horizontal(|ui| {
+            if connected {
+                let link = self.monitor.as_ref().map_or("", |m| if m.link() == Link::Simulator { "simulator" } else { "serial" });
+                ui.label(format!("Connected ({link})"));
+                if ui.button("Disconnect").clicked()
+                    && let Some(m) = &self.monitor
+                {
+                    m.disconnect();
+                }
+            } else {
+                egui::ComboBox::from_id_salt("lasercraft_ports")
+                    .selected_text(if self.connection_port.is_empty() { "Serial port" } else { &self.connection_port })
+                    .show_ui(ui, |ui| {
+                        for port in &self.detected_ports {
+                            ui.selectable_value(&mut self.connection_port, port.clone(), port);
+                        }
+                    });
+                if ui.button("Find ports").clicked() {
+                    match grbl_monitor::list_ports() {
+                        Ok(ports) => self.detected_ports = ports,
+                        Err(e) => self.message = format!("Port discovery failed: {e}"),
+                    }
+                }
+                let expect =
+                    lasercraft_machine::grbl::Expect { max_s: Some(f64::from(self.max_s)), bed: Some((self.machine_width, self.machine_height)) };
+                if ui.add_enabled(self.controller == "GRBL" && !self.connection_port.is_empty(), egui::Button::new("Connect")).clicked() {
+                    self.monitor = Some(Monitor::connect(self.connection_port.clone(), self.connection_baud, expect));
+                }
+                if ui.button("Simulator").on_hover_text("Connect the built-in GRBL simulator: nothing physical moves").clicked() {
+                    self.monitor = Some(Monitor::connect_simulator(expect));
+                }
+            }
+        });
+        if self.controller == "Ruida" {
+            ui.colored_label(t.warning, "Ruida machines can't be controlled yet: GRBL only.");
+        }
+        if !connected {
+            return;
+        }
+        // State, position and alarm.
+        let s = self.monitor_status.clone();
+        ui.horizontal(|ui| {
+            ui.strong(if s.state.is_empty() { "State unknown" } else { s.state.as_str() });
+            if let Some(p) = s.work_position.or(s.machine_position) {
+                ui.monospace(format!("X {:.2}  Y {:.2}  Z {:.2}", p[0], p[1], p[2]));
+            }
+        });
+        if let Some(alarm) = &s.alarm {
+            ui.colored_label(t.error, alarm);
+        }
+        let idle = s.state.eq_ignore_ascii_case("Idle") && s.alarm.is_none();
+        let job_active = self.stream_progress.as_ref().is_some_and(|p| p.sent > 0 && !p.finished && p.failed.is_none());
+        ui.horizontal(|ui| {
+            if ui.button("Hold").clicked()
+                && let Some(m) = &self.monitor
+            {
+                m.hold();
+            }
+            if ui.button("Resume").clicked()
+                && let Some(m) = &self.monitor
+            {
+                m.resume();
+            }
+            let stop = egui::Button::new(egui::RichText::new("STOP").strong().color(t.error));
+            if ui
+                .add(stop)
+                .on_hover_text("Feed hold, then a soft reset once halted: the laser goes off and the job is dropped. Not an emergency stop.")
+                .clicked()
+                && let Some(m) = &self.monitor
+            {
+                m.stop();
+                self.coordinator.shutdown();
+            }
+        });
+        ui.checkbox(&mut self.motion_unlocked, "Motion enabled (the machine may move)");
+        let can_move = self.motion_unlocked && !job_active;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(can_move, egui::Button::new("Unlock")).on_hover_text("Clear an alarm lock ($X) after checking the machine").clicked()
+                && let Some(m) = &self.monitor
+            {
+                m.unlock();
+            }
+            if ui.add_enabled(can_move, egui::Button::new("Home")).on_hover_text("Move to the home switches ($H)").clicked()
+                && let Some(m) = &self.monitor
+            {
+                m.home();
+            }
+            ui.separator();
+            ui.add(egui::DragValue::new(&mut self.jog_distance).range(0.1..=10.0).suffix(" mm"));
+            ui.add(egui::DragValue::new(&mut self.jog_feed).range(1.0..=1000.0).suffix(" mm/min"));
+            for (label, axis, sign) in [("X−", 'X', -1.0), ("X+", 'X', 1.0), ("Y−", 'Y', -1.0), ("Y+", 'Y', 1.0)] {
+                if ui.add_enabled(can_move && idle, egui::Button::new(label)).clicked()
+                    && let Some(m) = &self.monitor
+                    && let Err(e) = m.jog(axis, sign * self.jog_distance, self.jog_feed)
+                {
+                    self.message = e;
+                }
+            }
+        });
+        // Frame and start: the generated job (Generate from document).
+        let have_job = !self.generated_gcode.trim().is_empty();
+        ui.horizontal(|ui| {
+            let frame = ui
+                .add_enabled(can_move && idle && have_job, egui::Button::new("Frame"))
+                .on_hover_text("Trace the job's outline with the laser off, to check where it lands");
+            ui.add(egui::DragValue::new(&mut self.frame_feed).range(60.0..=20_000.0).suffix(" mm/min"));
+            if frame.clicked() {
+                match self.summarize(&self.generated_gcode).extent {
+                    Some(extent) => {
+                        if let Some(m) = &self.monitor
+                            && let Err(e) = m.start_job(laser_doc::frame_gcode(extent, self.frame_feed))
+                        {
+                            self.message = e;
+                        }
+                    }
+                    None => self.message = "the job doesn't move: nothing to frame".into(),
+                }
+            }
+            if ui.add_enabled(idle && have_job && !job_active, egui::Button::new("Start job…")).clicked() {
+                let summary = self.summarize(&self.generated_gcode);
+                self.confirm_job = Some((summary, self.generated_gcode.clone()));
+                self.confirm_checked = false;
+            }
+        });
+        if !have_job {
+            ui.small("Generate a job from the document first.");
+        }
+        if let Some(p) = &self.stream_progress {
+            let frac = if p.total == 0 { 0.0 } else { p.acknowledged as f32 / p.total as f32 };
+            ui.add(egui::ProgressBar::new(frac).text(format!("{} / {} lines", p.acknowledged, p.total)));
+            if p.finished {
+                ui.colored_label(t.warning, "All lines taken: the machine may still be moving. Wait for Idle before approaching.");
+            }
+            if let Some(e) = &p.failed {
+                ui.colored_label(t.error, e);
+            }
+        }
+        if self.coordinator.stage != Stage::Idle {
+            ui.small(format!("Accessories: {:?}", self.coordinator.stage));
+            if self.coordinator.stage == Stage::Fault && ui.button("Acknowledge accessory fault (check the hardware is off first)").clicked() {
+                self.coordinator.reset_fault();
+            }
+        }
+        egui::CollapsingHeader::new("Console").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Identify ($I)").clicked()
+                    && let Some(m) = &self.monitor
+                {
+                    m.identify();
+                }
+                if ui.button("Settings ($$)").clicked()
+                    && let Some(m) = &self.monitor
+                {
+                    m.settings();
+                }
+            });
+            if !self.monitor_status.raw.is_empty() {
+                ui.small(format!("Last status: {}", self.monitor_status.raw));
+            }
+            egui::ScrollArea::vertical().max_height(110.0).stick_to_bottom(true).show(ui, |ui| {
+                for line in self.monitor_log.iter().rev().take(40).rev() {
+                    ui.small(line);
+                }
+            });
+        });
+        ui.small("Software controls are not safety interlocks: keep the enclosure closed, the area clear and a hardware E-stop in reach.");
+        self.confirm_window(ui.ctx());
+    }
+
+    /// The confirmation before a job starts: what it will do, what's wrong with it, and the
+    /// operator's tick.
+    fn confirm_window(&mut self, ctx: &egui::Context) {
+        let Some((summary, gcode)) = self.confirm_job.clone() else { return };
+        let t = vectorcraft_ui_egui::theme::Tokens::get(ctx);
+        let mut open = true;
+        let mut decided: Option<bool> = None;
+        egui::Window::new("Start laser job?").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+            if let Some((lo, hi)) = summary.extent {
+                ui.label(format!(
+                    "{:.1} × {:.1} mm, from X {:.1} Y {:.1} to X {:.1} Y {:.1}",
+                    hi[0] - lo[0],
+                    hi[1] - lo[1],
+                    lo[0],
+                    lo[1],
+                    hi[0],
+                    hi[1]
+                ));
+            }
+            ui.label(format!("{} lines, highest power {:.0} %, about {}", summary.lines, summary.max_power, laser_doc::duration(summary.seconds)));
+            for p in &summary.problems {
+                ui.colored_label(t.error, p);
+            }
+            ui.checkbox(&mut self.confirm_checked, "Material, focus and air are set, the lid is closed, and someone stays with the machine");
+            ui.horizontal(|ui| {
+                let can = self.confirm_checked && summary.problems.is_empty();
+                if ui.add_enabled(can, egui::Button::new("Start")).clicked() {
+                    decided = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    decided = Some(false);
+                }
+            });
+        });
+        match decided {
+            Some(true) => {
+                self.confirm_job = None;
+                match self.coordinator.start(&self.accessory_config, gcode) {
+                    Ok(()) => {
+                        self.stream_progress = None;
+                        self.message = "Starting: accessories first, then the job".into();
+                    }
+                    Err(e) => self.message = e,
+                }
+            }
+            Some(false) => self.confirm_job = None,
+            None if !open => self.confirm_job = None,
+            None => {}
+        }
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, run: &mut laser_doc::Run) {
         if !self.open {
             return;
@@ -576,6 +819,7 @@ impl LaserPanel {
         let mut open = self.open;
         egui::Window::new("LaserCraft | Laser Operations").open(&mut open).default_width(350.0).resizable(true).show(ctx,|ui|{
    egui::CollapsingHeader::new("Document → laser job").default_open(true).show(ui,|ui|self.document_section(ui,run));
+   egui::CollapsingHeader::new("Machine").default_open(true).show(ui,|ui|self.machine_section(ui));
    ui.separator();
    ui.horizontal(|ui| {ui.heading("Panel cut layers"); if ui.button("+ Add").clicked(){let idx=self.layers.len();self.layers.push(LaserLayer::new(&format!("C{idx:02}"),Color32::LIGHT_BLUE));self.selected=idx;}});
    egui::ScrollArea::vertical().max_height(190.0).show(ui,|ui|{
@@ -999,59 +1243,6 @@ impl LaserPanel {
     ui.small("Observed UDP peers are NOT verified Ruida controllers. No status fields are decoded. The controller may not send unsolicited traffic. A silent capture does not mean a device is absent. Ruida models and protocol versions require validation before active discovery or control.");
     egui::ScrollArea::vertical().max_height(110.0).show(ui,|ui|{for line in self.ruida_log.iter().rev().take(30){ui.monospace(line);}});
    });
-   ui.collapsing("Phase 9 | GRBL connection and supervised control",|ui|{
-    ui.small("GRBL 1.1 serial devices only. No laser activation, homing, framing or job streaming. Physical E-stop and interlocks remain essential.");
-    if ui.button("Refresh serial ports").clicked(){match grbl_monitor::list_ports(){Ok(ports)=>self.detected_ports=ports,Err(e)=>self.message=format!("Port discovery failed: {e}")}}
-    egui::ComboBox::from_id_salt("lasercraft_ports").selected_text(if self.connection_port.is_empty(){"Select serial port"}else{&self.connection_port}).show_ui(ui,|ui|{
-     for port in &self.detected_ports {ui.selectable_value(&mut self.connection_port,port.clone(),port);}
-    });
-    ui.horizontal(|ui|{
-     if self.monitor.is_none(){if ui.add_enabled(self.controller=="GRBL" && !self.connection_port.is_empty(),egui::Button::new("Connect GRBL")).clicked(){let expect=lasercraft_machine::grbl::Expect{max_s:Some(f64::from(self.max_s)),bed:Some((self.machine_width,self.machine_height))};self.monitor=Some(Monitor::connect(self.connection_port.clone(),self.connection_baud,expect));}}
-     else if ui.button("Disconnect").clicked()&& let Some(m)=&self.monitor{m.disconnect();}
-    });
-    ui.separator();
-    ui.label("Phase 9 | GRBL 1.1 supervised control (EXPERIMENTAL)");
-    ui.horizontal(|ui|{if ui.button("Identify ($I)").clicked()&& let Some(m)=&self.monitor{m.identify();}
-      if ui.button("Read settings ($$)").clicked()&& let Some(m)=&self.monitor{m.settings();}});
-    // Unlocking clears an alarm's lock and homing moves the machine: both need motion enabled.
-    ui.horizontal(|ui|{let can=self.motion_unlocked && self.monitor.is_some();
-      if ui.add_enabled(can,egui::Button::new("Unlock ($X)")).on_hover_text("Clear an alarm lock after checking the machine").clicked()&& let Some(m)=&self.monitor{m.unlock();}
-      if ui.add_enabled(can,egui::Button::new("Home ($H)")).on_hover_text("The machine moves to its home switches").clicked()&& let Some(m)=&self.monitor{m.home();}});
-    ui.horizontal(|ui|{if ui.button("Feed hold (!)").clicked()&& let Some(m)=&self.monitor{m.hold();}
-      if ui.button("Resume (~)").clicked()&& let Some(m)=&self.monitor{m.resume();}});
-    ui.checkbox(&mut self.motion_unlocked,"Enable supervised jogging (machine can move)");
-    ui.small("Only use with laser physically disabled, enclosure closed, clear work area, and a reachable hardware E-stop. Software controls are not safety interlocks.");
-    ui.horizontal(|ui|{ui.label("Distance mm");ui.add(egui::DragValue::new(&mut self.jog_distance).range(0.1..=10.0));ui.label("Feed mm/min");ui.add(egui::DragValue::new(&mut self.jog_feed).range(1.0..=1000.0));});
-    let ready=self.motion_unlocked && self.monitor.is_some() && self.monitor_status.state.eq_ignore_ascii_case("Idle") && self.monitor_status.alarm.is_none();
-    ui.horizontal_wrapped(|ui|{for (label,axis,sign) in [("X−",'X',-1.0),("X+",'X',1.0),("Y−",'Y',-1.0),("Y+",'Y',1.0),("Z−",'Z',-1.0),("Z+",'Z',1.0)]{
-     if ui.add_enabled(ready,egui::Button::new(label)).clicked()&& let Some(m)=&self.monitor&& let Err(e)=m.jog(axis,sign*self.jog_distance,self.jog_feed){self.message=e;}
-    }});
-    ui.small("Jog is GRBL 1.1 only; position bounds must be enforced by controller soft limits.");
-    ui.separator();
-    ui.heading("Phase 10 | Supervised GRBL job streaming (EXPERIMENTAL)");
-    ui.small("WARNING: Generated G-code may fire the laser. Use only after dry-run validation, with enclosure/interlocks, ventilation, fire supervision, and a physical E-stop. Cancellation issues feed hold, NOT a hardware emergency stop.");
-    ui.checkbox(&mut self.stream_armed,"Arm laser job streaming (I have inspected the G-code and machine)");
-    let job_active=self.stream_progress.as_ref().is_some_and(|p|p.sent>0&&!p.finished&&p.failed.is_none());
-    let can_start=self.stream_armed && !job_active && self.controller=="GRBL" && self.monitor.is_some() && self.monitor_status.state.eq_ignore_ascii_case("Idle") && self.monitor_status.alarm.is_none() && !self.generated_gcode.trim().is_empty();
-    ui.horizontal(|ui|{
-     if ui.add_enabled(can_start,egui::Button::new("START LASER JOB")).clicked()&& let Some(_m)=&self.monitor{match self.coordinator.start(&self.accessory_config,self.generated_gcode.clone()){Ok(())=>{self.stream_armed=false;self.stream_progress=None;self.message="Starting independent accessories before job".into();},Err(e)=>self.message=e}}
-     if ui.add_enabled(job_active,egui::Button::new("Cancel / feed hold")).clicked()&& let Some(m)=&self.monitor{m.cancel_job();self.coordinator.shutdown();}
-     if ui.add_enabled(self.monitor.is_some(),egui::Button::new("STOP (hold, then reset)")).on_hover_text("Feed hold, then a soft reset once halted: the laser goes off and the job is dropped. Not an emergency stop.").clicked()&& let Some(m)=&self.monitor{m.stop();self.coordinator.shutdown();}
-    });
-    ui.label(format!("Independent accessory coordinator: {:?}",self.coordinator.stage));
-    if self.coordinator.stage==Stage::Fault && ui.button("Acknowledge accessory fault (verify hardware OFF first)").clicked(){self.coordinator.reset_fault();}
-    if matches!(self.coordinator.stage,Stage::Running|Stage::Ready|Stage::Starting) && ui.button("Request accessory shutdown").clicked(){self.coordinator.shutdown();if let Some(m)=&self.monitor{m.cancel_job();}}
-    for entry in self.coordinator.log.iter().rev().take(4){ui.small(entry);}
-    if let Some(p)=&self.stream_progress{ui.label(format!("GRBL acknowledgements: {} / {} (sent {})",p.acknowledged,p.total,p.sent));ui.add(egui::ProgressBar::new(if p.total==0{0.0}else{p.acknowledged as f32/p.total as f32}).show_percentage());if p.finished{ui.colored_label(Color32::YELLOW,"All lines acknowledged; machine may still be moving. Wait for Idle before approaching.");}
-      if let Some(e)=&p.failed{ui.colored_label(Color32::RED,e);}}
-    ui.label(format!("State: {}",if self.monitor_status.state.is_empty(){"Unknown"}else{&self.monitor_status.state}));
-    if let Some(pos)=self.monitor_status.machine_position {ui.label(format!("Machine X {:.3}  Y {:.3}  Z {:.3} mm",pos[0],pos[1],pos[2]));}
-    if let Some(pos)=self.monitor_status.work_position {ui.label(format!("Work X {:.3}  Y {:.3}  Z {:.3} mm",pos[0],pos[1],pos[2]));}
-    if let Some(alarm)=&self.monitor_status.alarm{ui.colored_label(Color32::RED,alarm);}
-    ui.label(format!("Last status: {}",self.monitor_status.raw));
-    egui::ScrollArea::vertical().max_height(90.0).show(ui,|ui|{for line in self.monitor_log.iter().rev().take(15){ui.small(line);}});
-    if self.controller=="Ruida"{ui.colored_label(Color32::YELLOW,"Ruida protocol is not implemented.");}
-   });
    ui.separator();ui.collapsing("Machine profile",|ui|{
     ui.horizontal(|ui|{ui.label("Bed width (mm)");ui.add(egui::DragValue::new(&mut self.machine_width).range(1.0..=10000.0));});
     ui.horizontal(|ui|{ui.label("Bed height (mm)");ui.add(egui::DragValue::new(&mut self.machine_height).range(1.0..=10000.0));});
@@ -1424,6 +1615,52 @@ mod tests {
         }
         // Nothing reached the controller: no job ever started.
         assert!(p.automation("laser.machine.status", &json!({})).unwrap()["job"].is_null());
+        p.automation("laser.machine.disconnect", &json!({})).unwrap();
+    }
+
+    /// The texts one headless frame of the Machine section draws.
+    fn machine_texts(p: &mut LaserPanel) -> Vec<String> {
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0))), ..Default::default() };
+        // A new window is measured on its first frame and drawn on the next.
+        let mut first = ctx.run_ui(raw.clone(), |ui| p.machine_section(ui));
+        first.textures_delta.clear();
+        let mut out = ctx.run_ui(raw, |ui| p.machine_section(ui));
+        out.textures_delta.clear();
+        let mut all = vec![];
+        out.shapes.iter().for_each(|c| texts(&c.shape, &mut all));
+        all
+    }
+
+    /// The Machine section: connect choices when nothing is connected; on the simulator, its
+    /// state, STOP, Frame and Start job…; Start asks for a confirmation with the job's summary.
+    #[test]
+    fn machine_section_and_its_confirmation() {
+        let mut p = LaserPanel { monitor: None, ..LaserPanel::default() };
+        let t = machine_texts(&mut p);
+        assert!(t.iter().any(|s| s == "Simulator") && t.iter().any(|s| s == "Connect"), "{t:?}");
+        p.automation("laser.machine.connect", &json!({"simulator": true})).unwrap();
+        until(&mut p, "laser.machine.status", |v| v["state"] == "Idle");
+        p.generated_gcode = "G21\nG90\nG0 X10 Y10\nM4 S500\nG1 X40 Y10 F1000\nM5\n".into();
+        let t = machine_texts(&mut p);
+        for want in ["Connected (simulator)", "Idle", "STOP", "Frame", "Start job…", "Motion enabled (the machine may move)"] {
+            assert!(t.iter().any(|s| s == want), "{want}: {t:?}");
+        }
+        let summary = p.summarize(&p.generated_gcode.clone());
+        assert!(summary.problems.is_empty() && summary.fits && (summary.max_power - 50.0).abs() < 1e-9, "{summary:?}");
+        p.confirm_job = Some((summary, p.generated_gcode.clone()));
+        let t = machine_texts(&mut p);
+        assert!(t.iter().any(|s| s == "Start laser job?") && t.iter().any(|s| s.contains("highest power 50 %")), "{t:?}");
+        // A job off the bed is listed as a problem (Start stays off).
+        let off = p.summarize("G21\nG0 X900 Y10\nG1 X950 S100 F600");
+        assert!(off.problems.iter().any(|x| x.contains("outside")));
         p.automation("laser.machine.disconnect", &json!({})).unwrap();
     }
 

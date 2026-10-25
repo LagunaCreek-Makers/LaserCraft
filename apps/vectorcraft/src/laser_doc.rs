@@ -29,6 +29,66 @@ pub struct Bed {
     pub acceleration: f64,
 }
 
+/// What the operator confirms before a job starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobSummary {
+    pub lines: usize,
+    /// The smallest and largest X/Y the job reaches (mm), when it moves.
+    pub extent: Option<([f64; 2], [f64; 2])>,
+    /// It stays on the bed.
+    pub fits: bool,
+    /// The highest laser power it asks for (% of the machine's maxS).
+    pub max_power: f64,
+    pub seconds: f64,
+    /// Reasons it can't start.
+    pub problems: Vec<String>,
+}
+
+/// The summary of `gcode` for a machine with bed `bed` (mm), full power at `max_s` and `motion`.
+pub fn job_summary(gcode: &str, bed: (f64, f64), max_s: u32, motion: &lasercraft_machine::grbl::Motion) -> JobSummary {
+    use lasercraft_machine::grbl;
+    let mut problems = vec![];
+    let lines = match grbl::job_lines(gcode) {
+        Ok(l) => l,
+        Err(e) => {
+            problems.push(e);
+            vec![]
+        }
+    };
+    let extent = match grbl::job_extent(&lines) {
+        Ok(e) => e,
+        Err(e) => {
+            problems.push(e);
+            None
+        }
+    };
+    let fits = extent.is_none_or(|(lo, hi)| lo[0] >= -1e-6 && lo[1] >= -1e-6 && hi[0] <= bed.0 + 1e-6 && hi[1] <= bed.1 + 1e-6);
+    if !fits {
+        problems.push(format!("the job reaches outside the {:.0} × {:.0} mm bed", bed.0, bed.1));
+    }
+    // The S words, as a share of full power.
+    let max_s_seen = lines
+        .iter()
+        .flat_map(|l| l.split_whitespace())
+        .filter_map(|w| w.strip_prefix('S').or_else(|| w.strip_prefix('s')).and_then(|v| v.parse::<f64>().ok()))
+        .filter(|v| v.is_finite())
+        .fold(0.0f64, f64::max);
+    let max_power = max_s_seen / f64::from(max_s.max(1)) * 100.0;
+    if max_power > 100.0 + 1e-6 {
+        problems.push(format!("the job asks for S{max_s_seen}, above the machine's full power (S{max_s})"));
+    }
+    JobSummary { lines: lines.len(), extent, fits, max_power, seconds: grbl::estimate(gcode, motion).seconds, problems }
+}
+
+/// G-code tracing the rectangle around `extent` with the laser off (M5, no S), at `feed`.
+pub fn frame_gcode((lo, hi): ([f64; 2], [f64; 2]), feed: f64) -> String {
+    let f = feed.clamp(60.0, 20_000.0);
+    format!(
+        "G21\nG90\nM5\nG0 X{:.3} Y{:.3}\nG1 X{:.3} Y{:.3} F{f:.0}\nG1 X{:.3} Y{:.3}\nG1 X{:.3} Y{:.3}\nG1 X{:.3} Y{:.3}\nM5\n",
+        lo[0], lo[1], hi[0], lo[1], hi[0], hi[1], lo[0], hi[1], lo[0], lo[1]
+    )
+}
+
 /// `seconds` as people read a job's length: "42 s", "3 min 05 s", "1 h 02 min".
 pub fn duration(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
@@ -391,6 +451,25 @@ mod tests {
         max_rate: 6000.0,
         acceleration: 1000.0,
     };
+
+    #[test]
+    fn job_summary_and_frame() {
+        let m = lasercraft_machine::grbl::Motion::default();
+        let job = "G21\nG90\nM5\nG0 X10 Y20\nM4 S500\nG1 X60 Y20 F1000\nG1 X60 Y50\nM5\n";
+        let s = job_summary(job, (300.0, 200.0), 1000, &m);
+        assert_eq!((s.lines, s.extent, s.fits), (8, Some(([10.0, 20.0], [60.0, 50.0])), true));
+        assert!((s.max_power - 50.0).abs() < 1e-9 && s.seconds > 0.0 && s.problems.is_empty(), "{s:?}");
+        let s = job_summary(job, (50.0, 200.0), 1000, &m);
+        assert!(!s.fits && s.problems.iter().any(|p| p.contains("outside")));
+        assert!(job_summary(job, (300.0, 200.0), 255, &m).problems.iter().any(|p| p.contains("S500")));
+        assert!(!job_summary("$H", (300.0, 200.0), 1000, &m).problems.is_empty());
+        // The frame traces the job's box, laser off (no S, no M3/M4).
+        let f = frame_gcode(([10.0, 20.0], [60.0, 50.0]), 3000.0);
+        assert!(f.contains("G0 X10.000 Y20.000") && f.contains("G1 X60.000 Y20.000 F3000") && f.contains("G1 X10.000 Y20.000"));
+        assert!(!f.contains('S') && !f.contains("M3") && !f.contains("M4"));
+        let fs = job_summary(&f, (300.0, 200.0), 1000, &m);
+        assert_eq!((fs.max_power, fs.extent), (0.0, Some(([10.0, 20.0], [60.0, 50.0]))));
+    }
 
     #[test]
     fn durations_read_naturally() {
