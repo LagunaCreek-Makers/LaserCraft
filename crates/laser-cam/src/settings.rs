@@ -21,6 +21,8 @@ pub const MAX_PASSES: u32 = 100;
 
 /// Finest and coarsest Fill line interval (mm).
 pub const INTERVAL_RANGE: std::ops::RangeInclusive<f64> = 0.01..=10.0;
+/// Coarsest and finest Image pixel size along the line (pixels per inch: 2540 is 0.01 mm).
+pub const DPI_RANGE: std::ops::RangeInclusive<f64> = 10.0..=2540.0;
 /// Longest Fill overscan (mm).
 pub const MAX_OVERSCAN_MM: f64 = 50.0;
 
@@ -96,6 +98,10 @@ pub struct LayerSettings {
     pub min_power_percent: f64,
     /// Image: burn the light parts instead of the dark ones.
     pub negative: bool,
+    /// Image: pixels per inch along each line (the pixel size); `None` (and settings saved
+    /// before it existed): one pixel per line interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dpi: Option<f64>,
 }
 
 impl Default for LayerSettings {
@@ -114,11 +120,17 @@ impl Default for LayerSettings {
             dither: Dither::FloydSteinberg,
             min_power_percent: 0.0,
             negative: false,
+            dpi: None,
         }
     }
 }
 
 impl LayerSettings {
+    /// Image: the pixel size along each line (mm), from `dpi`, else the line interval.
+    pub fn pixel_mm(&self) -> f64 {
+        self.dpi.map_or(self.interval_mm, |d| 25.4 / d)
+    }
+
     /// An error naming the first value out of range.
     pub fn validate(&self) -> Result<(), String> {
         if !(self.speed_mm_min.is_finite() && self.speed_mm_min > 0.0 && self.speed_mm_min <= MAX_SPEED_MM_MIN) {
@@ -135,6 +147,11 @@ impl LayerSettings {
         }
         if !(self.angle_deg.is_finite() && (-360.0..=360.0).contains(&self.angle_deg)) {
             return Err(format!("angle must be from -360 to 360 degrees, not {}", self.angle_deg));
+        }
+        if let Some(dpi) = self.dpi
+            && !(dpi.is_finite() && DPI_RANGE.contains(&dpi))
+        {
+            return Err(format!("dpi must be from {} to {}, not {dpi}", DPI_RANGE.start(), DPI_RANGE.end()));
         }
         if !(self.min_power_percent.is_finite() && (0.0..=self.power_percent).contains(&self.min_power_percent)) {
             return Err(format!("minimum power must be from 0 to the power ({} %), not {}", self.power_percent, self.min_power_percent));

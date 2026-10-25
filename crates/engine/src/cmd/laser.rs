@@ -70,7 +70,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Laser Layer Settings",
             [],
             None,
-            "{layer: layer id, speed?: mm/min (default 1000), power?: 0–100 % (default 20), passes?: 1–100 (default 1), enabled?: true, mode?: line (cut along the paths, default)|fill (engrave inside closed shapes with scan lines)|image (engrave placed images line by line), interval?: fill or image line spacing (0.01–10 mm; default 0.1), angle?: fill line angle (degrees counter-clockwise; default 0: horizontal), bidirectional?: true (every other fill line runs back), overscan?: 0–50 mm the head runs past each fill line at power 0 (default 0; shortened at the bed's edges), crosshatch?: false (fill again at right angles), dither?: image grey levels: floydSteinberg (default)|jarvis|ordered|threshold|grayscale (power from darkness between minPower and power), minPower?: image power of the lightest grey burnt (0 to power; default 0), negative?: false (image: burn the light parts), clear?: false (back to the defaults)} → {layer, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, dither, minPower, negative}. Values not given keep the layer's current ones. Saved with the document",
+            "{layer: layer id, speed?: mm/min (default 1000), power?: 0–100 % (default 20), passes?: 1–100 (default 1), enabled?: true, mode?: line (cut along the paths, default)|fill (engrave inside closed shapes with scan lines)|image (engrave placed images line by line), interval?: fill or image line spacing (0.01–10 mm; default 0.1), angle?: fill line angle (degrees counter-clockwise; default 0: horizontal), bidirectional?: true (every other fill line runs back), overscan?: 0–50 mm the head runs past each fill line at power 0 (default 0; shortened at the bed's edges), crosshatch?: false (fill again at right angles), dither?: image grey levels: floydSteinberg (default)|jarvis|ordered|threshold|grayscale (power from darkness between minPower and power), minPower?: image power of the lightest grey burnt (0 to power; default 0), negative?: false (image: burn the light parts), dpi?: image pixels per inch along each line (10–2540; null: one pixel per interval, the default), clear?: false (back to the defaults)} → {layer, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, dither, minPower, negative, dpi}. Values not given keep the layer's current ones. Saved with the document",
             has_doc,
             set_layer
         ),
@@ -79,7 +79,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Laser Layers",
             [],
             None,
-            "{} → {layers: [{layer, name, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, dither, minPower, negative, custom}]}: every layer (sublayers too) with the laser settings it cuts with, top-level layers bottom first",
+            "{} → {layers: [{layer, name, speed, power, passes, enabled, mode, interval, angle, bidirectional, overscan, crosshatch, dither, minPower, negative, dpi, custom}]}: every layer (sublayers too) with the laser settings it cuts with, top-level layers bottom first",
             has_doc,
             list_layers
         ),
@@ -186,11 +186,12 @@ fn settings_json(id: NodeId, s: &LayerSettings) -> Value {
         "dither": s.dither.id(),
         "minPower": s.min_power_percent,
         "negative": s.negative,
+        "dpi": s.dpi,
     })
 }
 
 fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
-    check_numbers(p, &["speed", "power", "passes", "interval", "angle", "overscan", "minPower"], SET)?;
+    check_numbers(p, &["speed", "power", "passes", "interval", "angle", "overscan", "minPower", "dpi"], SET)?;
     let layer = p.get("layer").ok_or_else(|| bad(SET, "missing `layer` (a layer id)"))?;
     let id = checked_id(s, layer, SET)?;
     let doc = &s.doc()?.doc;
@@ -220,6 +221,12 @@ fn set_layer(s: &mut Session, p: &Value) -> Result<Value> {
         v.angle_deg = f64_or(p, "angle", v.angle_deg);
         v.overscan_mm = f64_or(p, "overscan", v.overscan_mm);
         v.min_power_percent = f64_or(p, "minPower", v.min_power_percent);
+        // null: back to one pixel per line interval.
+        match p.get("dpi") {
+            None => {}
+            Some(Value::Null) => v.dpi = None,
+            Some(d) => v.dpi = d.as_f64(),
+        }
         if let Some(d) = str_param(p, "dither") {
             v.dither = Dither::parse(d).ok_or_else(|| bad(SET, format!("dither `{d}`: threshold, ordered, floydSteinberg, jarvis or grayscale")))?;
         }
@@ -414,6 +421,10 @@ mod tests {
             (Some("image"), Some("jarvis"), Some(15.0), Some(true))
         );
         assert_eq!(s.execute("laser.layers", &json!({})).unwrap()["layers"][0]["dither"], "jarvis");
+        // DPI apart from the line interval; null goes back to one pixel per interval.
+        assert_eq!(s.execute(SET, &json!({"layer": l, "dpi": 508})).unwrap()["dpi"], 508.0);
+        assert!(s.execute(SET, &json!({"layer": l, "dpi": null})).unwrap()["dpi"].is_null());
+        assert!(s.execute(SET, &json!({"layer": l, "dpi": 5})).is_err());
         for bad in [json!({"dither": "halftone"}), json!({"minPower": 90}), json!({"negative": 1})] {
             let mut p = bad.clone();
             p["layer"] = json!(l);

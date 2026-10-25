@@ -105,11 +105,17 @@ impl App {
         // The panel acts on the document through commands, as the person at the keyboard.
         let app = &mut self.app;
         self.laser_panel.show(ui.ctx(), &mut |id, params| file_access::unconfined(|| app.run(id, params)));
-        egui::Window::new("LaserCraft Camera Tools").default_pos(egui::pos2(10.0, 55.0)).show(ui.ctx(), |ui| {
-            if ui.button("Camera placement overlay").clicked() {
-                self.camera_overlay.open = true;
-            }
-        });
+        // At the bottom-left, clear of the laser panel at the top-left; egui keeps where it is
+        // moved for the session.
+        let screen = ui.ctx().content_rect();
+        egui::Window::new("LaserCraft Camera Tools")
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .default_pos(egui::pos2(screen.left() + 10.0, screen.bottom() - 40.0))
+            .show(ui.ctx(), |ui| {
+                if ui.button("Camera placement overlay").clicked() {
+                    self.camera_overlay.open = true;
+                }
+            });
         self.camera_overlay.show(
             ui.ctx(),
             self.laser_panel.camera_gcode(),

@@ -225,7 +225,7 @@ fn engrave_image(
     let o = img.to_mm * Point::ZERO;
     let u = img.to_mm * Point::new(f64::from(img.width), 0.0) - o;
     let v = img.to_mm * Point::new(0.0, f64::from(img.height)) - o;
-    let (cols, rows) = raster::grid((u.hypot(), v.hypot()), s.interval_mm)?;
+    let (cols, rows) = raster::grid((u.hypot(), v.hypot()), s.pixel_mm(), s.interval_mm)?;
     // Samples at the crossings of a (rows - 1) × (cols - 1) grid laid over the image.
     let (gr, gc) = (rows.saturating_sub(1).max(1), cols.saturating_sub(1).max(1));
     let Some(samples) = img.blob.grid_samples(gr, gc) else { return Ok(None) };

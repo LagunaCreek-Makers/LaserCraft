@@ -143,14 +143,14 @@ pub(crate) fn power(level: f32, min: f64, max: f64) -> Option<f64> {
     (level > 1e-3).then(|| min + (max - min) * f64::from(level.clamp(0.0, 1.0)))
 }
 
-/// The samples (columns, rows) an image of `size_mm` (width, height along its own axes) gets at
-/// `interval` mm: an error when there would be too many.
-pub(crate) fn grid(size_mm: (f64, f64), interval: f64) -> Result<(u32, u32), String> {
-    let n = |len: f64| (len / interval).round().max(1.0);
-    let (c, r) = (n(size_mm.0), n(size_mm.1));
+/// The samples (columns, rows) an image of `size_mm` (width, height along its own axes) gets with
+/// `pixel` mm along its lines and lines `interval` mm apart: an error when there would be too many.
+pub(crate) fn grid(size_mm: (f64, f64), pixel: f64, interval: f64) -> Result<(u32, u32), String> {
+    let n = |len: f64, step: f64| (len / step).round().max(1.0);
+    let (c, r) = (n(size_mm.0, pixel), n(size_mm.1, interval));
     if !(c.is_finite() && r.is_finite()) || c > MAX_SIDE as f64 || r > MAX_SIDE as f64 || c * r > MAX_SAMPLES as f64 {
         return Err(format!(
-            "an image is too large to engrave at a {interval} mm interval (more than {MAX_SAMPLES} samples or {MAX_SIDE} along a side): use a larger interval"
+            "an image is too large to engrave with {pixel:.4} mm pixels {interval} mm apart (more than {MAX_SAMPLES} samples or {MAX_SIDE} along a side): use a lower DPI or a larger interval"
         ));
     }
     Ok((c as u32, r as u32))
@@ -206,11 +206,14 @@ mod tests {
 
     #[test]
     fn sample_grid_is_capped() {
-        assert_eq!(grid((10.0, 5.0), 0.1).unwrap(), (100, 50));
-        assert_eq!(grid((0.01, 0.01), 0.1).unwrap(), (1, 1));
-        assert!(grid((5000.0, 5000.0), 0.01).is_err());
-        assert!(grid((1.0e9, 1.0), 1.0).is_err());
-        assert!(grid((f64::INFINITY, 1.0), 1.0).is_err());
+        assert_eq!(grid((10.0, 5.0), 0.1, 0.1).unwrap(), (100, 50));
+        // Pixels finer than the lines: more columns, the same rows.
+        assert_eq!(grid((10.0, 5.0), 0.05, 0.1).unwrap(), (200, 50));
+        assert_eq!(grid((0.01, 0.01), 0.1, 0.1).unwrap(), (1, 1));
+        assert!(grid((5000.0, 5000.0), 0.01, 0.01).is_err());
+        assert!(grid((5000.0, 1.0), 0.01, 1.0).is_err(), "too many along a side");
+        assert!(grid((1.0e9, 1.0), 1.0, 1.0).is_err());
+        assert!(grid((f64::INFINITY, 1.0), 1.0, 1.0).is_err());
         // Mismatched sizes are clamped, never out of bounds.
         assert_eq!(levels(&[1.0; 3], 4, 4, Dither::Jarvis).len(), 3);
         assert!(levels(&[], 0, 0, Dither::FloydSteinberg).is_empty());

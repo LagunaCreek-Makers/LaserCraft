@@ -66,8 +66,9 @@ takes only comments, M-codes other than M3/M4 and G4 dwells there). `vectorcraft
 --machine` passes the profile's the same way. Export lists what was left out (images, type, gradients, clipping) or why
 it was refused (art off the bed). **Document layers** lists the document's layers
 (`laser.layers`) and sets their speed, power, passes and on/off with `laser.setLayer` (one undoable
-step each). The dry run draws the bed with the machine's origin corner. The pasted-SVG section is
-kept as legacy: it ignores the origin.
+step each). The dry run draws the bed with the machine's origin corner. The panel's own cut presets
+(for calibration tests and diagnostics) no longer have modes, and the pasted-SVG section is gone:
+layer modes are set in the document layer table only.
 
 ### Fill mode
 
@@ -85,8 +86,9 @@ overscan as travel.
 
 A layer in **Image** mode (`laser.setLayer {mode: image, interval, dither, power, minPower,
 negative, bidirectional, overscan}`) engraves the images placed on it line by line; paths on it are
-left out (with a warning), as images on Line and Fill layers are. Each image is resampled at
-`interval` along its own rows and columns (a turned image is engraved along its turned rows), each
+left out (with a warning), as images on Line and Fill layers are. Each image is resampled with
+lines `interval` apart and `dpi` pixels per inch along each line (no `dpi`, as in settings saved
+before it existed: one pixel per interval), along its own rows and columns (a turned image is engraved along its turned rows), each
 sample the area average of the pixels under it; transparent pixels never burn. `dither` turns grey
 levels into power: `floydSteinberg` (default) or `jarvis` error diffusion, `ordered` (4 × 4 Bayer)
 or `threshold` burn at full power or not at all; `grayscale` sets each sample's power between
