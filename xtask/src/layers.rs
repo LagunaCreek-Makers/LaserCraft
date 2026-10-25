@@ -67,6 +67,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("lasercraft-core", Class::Standalone),
     ("lasercraft-cam", Class::Layer(3)),
     ("lasercraft-cli", Class::Exempt),
+    ("lasercraft-machine", Class::Standalone),
 ];
 
 /// Explicit orderings *within* a layer (earlier may be used by later).

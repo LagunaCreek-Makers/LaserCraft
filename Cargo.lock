@@ -2323,6 +2323,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lasercraft-machine"
+version = "0.13.1"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4620,6 +4624,7 @@ dependencies = [
  "image",
  "lasercraft-cam",
  "lasercraft-core",
+ "lasercraft-machine",
  "log",
  "muda",
  "objc2 0.6.4",

@@ -21,6 +21,8 @@ vectorcraft-engine = { workspace = true }
 lasercraft-core = { path = "../../crates/lasercraft-core" }
 # Machine profile origins, shared with the engine's laser.exportGcode and vectorcraft-cli.
 lasercraft-cam = { path = "../../crates/laser-cam" }
+# The GRBL protocol, job streaming and the controller the serial thread runs.
+lasercraft-machine = { path = "../../crates/laser-machine" }
 vectorcraft-ui-egui = { workspace = true }
 vectorcraft-text = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wayland", "x11"] }

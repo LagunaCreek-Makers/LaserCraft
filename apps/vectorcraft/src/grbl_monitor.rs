@@ -1,8 +1,10 @@
-//! Phase 8: read-only GRBL serial monitoring. No motion or laser commands.
-//! Runs serial I/O off the egui thread; events are drained without blocking UI.
-use crate::grbl_stream::{Progress, Stream};
+//! The GRBL serial link: a thread that runs `lasercraft_machine::Controller` over the serial
+//! port, so the egui thread never blocks. The protocol, streaming and their tests live in
+//! `lasercraft-machine`; this is the port, the thread and the messages to and from the panel.
+use crate::grbl_stream::Progress;
+use lasercraft_machine::grbl::{State, StreamMode};
+use lasercraft_machine::{Controller, Transport};
 use std::{
-    io::{Read, Write},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
@@ -44,6 +46,18 @@ pub struct Monitor {
     pub events: Receiver<Event>,
     commands: Sender<Command>,
 }
+
+/// The serial port as the controller's link (reads time out quickly: nothing arrived).
+struct Serial(Box<dyn serialport::SerialPort>);
+impl Transport for Serial {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        std::io::Write::write_all(&mut self.0, bytes)
+    }
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.0, buf)
+    }
+}
+
 impl Monitor {
     pub fn identify(&self) {
         let _ = self.commands.send(Command::Identify);
@@ -58,19 +72,12 @@ impl Monitor {
         let _ = self.commands.send(Command::Resume);
     }
     pub fn jog(&self, axis: char, distance_mm: f64, feed_mm_min: f64) -> Result<(), String> {
-        if !matches!(axis, 'X' | 'Y' | 'Z')
-            || !distance_mm.is_finite()
-            || distance_mm.abs() > 10.0
-            || distance_mm == 0.0
-            || !feed_mm_min.is_finite()
-            || !(1.0..=1000.0).contains(&feed_mm_min)
-        {
-            return Err("Jog must be X/Y/Z, nonzero within ±10 mm, and 1–1000 mm/min".into());
-        }
+        use lasercraft_machine::controller::{MAX_JOG_FEED, MAX_JOG_MM};
+        lasercraft_machine::grbl::jog_line(axis, distance_mm, feed_mm_min, MAX_JOG_MM, MAX_JOG_FEED)?;
         self.commands.send(Command::Jog { axis, distance_mm, feed_mm_min }).map_err(|e| e.to_string())
     }
     pub fn start_job(&self, code: String) -> Result<(), String> {
-        Stream::new(&code)?;
+        lasercraft_machine::grbl::job_lines(&code)?;
         self.commands.send(Command::StartJob(code)).map_err(|e| e.to_string())
     }
     pub fn cancel_job(&self) {
@@ -83,7 +90,7 @@ impl Monitor {
         let (tx, events) = mpsc::channel();
         let (commands, rx) = mpsc::channel();
         thread::spawn(move || {
-            let mut port = match serialport::new(&port_name, baud).timeout(Duration::from_millis(120)).open() {
+            let port = match serialport::new(&port_name, baud).timeout(Duration::from_millis(120)).open() {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(Event::Disconnected(format!("Open failed: {e}")));
@@ -91,130 +98,47 @@ impl Monitor {
                 }
             };
             let _ = tx.send(Event::Connected);
-            // GRBL '?' is a read-only real-time status request. Do not reset controller on connect.
-            let mut last_poll = Instant::now() - Duration::from_secs(2);
-            let mut stream: Option<Stream> = None;
-            let mut pending = Vec::<u8>::new();
-            let mut buffer = [0u8; 256];
+            // One line at a time: nothing is queued in the controller unseen. The controller
+            // asks for status ('?', read-only) itself; connecting doesn't reset the machine.
+            let mut c = Controller::new(Serial(port), StreamMode::LineByLine);
+            let mut last_identity = vec![];
             loop {
+                let now = Instant::now();
                 match rx.try_recv() {
                     Ok(Command::Disconnect) => {
-                        if let Some(s) = stream.as_mut() {
-                            s.abort("Disconnected during job");
-                            let _ = tx.send(Event::JobProgress(s.progress.clone()));
+                        if c.job_active() {
+                            let _ = c.command(lasercraft_machine::Command::CancelJob, now);
                         }
                         break;
                     }
                     Ok(command) => {
-                        let result: Result<(), String> = match command {
-                            Command::StartJob(code) => {
-                                if stream.as_ref().is_some_and(|s| !s.progress.finished && s.progress.failed.is_none()) {
-                                    Err("Job already active".into())
-                                } else {
-                                    match Stream::new(&code) {
-                                        Ok(s) => {
-                                            let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                                            stream = Some(s);
-                                            Ok(())
-                                        }
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                            }
-                            Command::CancelJob => {
-                                if let Some(s) = stream.as_mut() {
-                                    s.abort("Cancelled by operator; controller feed hold requested");
-                                    let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                                }
-                                port.write_all(b"!").map_err(|e| e.to_string())
-                            }
-                            Command::Identify if stream.as_ref().is_some_and(|s| !s.progress.finished && s.progress.failed.is_none()) => {
-                                Err("Cannot query firmware during active job".into())
-                            }
-                            Command::Identify => port.write_all(b"$I\n").map_err(|e| e.to_string()),
-                            Command::Settings if stream.as_ref().is_some_and(|s| !s.progress.finished && s.progress.failed.is_none()) => {
-                                Err("Cannot query settings during active job".into())
-                            }
-                            Command::Settings => port.write_all(b"$$\n").map_err(|e| e.to_string()),
-                            Command::Hold => port.write_all(b"!").map_err(|e| e.to_string()),
-                            Command::Resume => port.write_all(b"~").map_err(|e| e.to_string()),
-                            Command::Jog { axis: _, distance_mm: _, feed_mm_min: _ }
-                                if stream.as_ref().is_some_and(|s| !s.progress.finished && s.progress.failed.is_none()) =>
-                            {
-                                Err("Jogging disabled during active job".into())
-                            }
-                            Command::Jog { axis, distance_mm, feed_mm_min } => {
-                                // GRBL 1.1 jogging command, independent of modal G-code state.
-                                let line = format!("$J=G91 G21 {axis}{distance_mm:.3} F{feed_mm_min:.1}\n");
-                                port.write_all(line.as_bytes()).map_err(|e| e.to_string())
-                            }
-                            Command::Disconnect => Ok(()),
+                        let command = match command {
+                            Command::Identify => lasercraft_machine::Command::Identify,
+                            Command::Settings => lasercraft_machine::Command::Settings,
+                            Command::Hold => lasercraft_machine::Command::Hold,
+                            Command::Resume => lasercraft_machine::Command::Resume,
+                            Command::Jog { axis, distance_mm, feed_mm_min } => lasercraft_machine::Command::Jog { axis, distance_mm, feed_mm_min },
+                            Command::StartJob(code) => lasercraft_machine::Command::StartJob(code),
+                            Command::CancelJob => lasercraft_machine::Command::CancelJob,
+                            Command::Disconnect => continue,
                         };
-                        if let Err(e) = result {
-                            let _ = tx.send(Event::Disconnected(format!("Command write failed: {e}")));
-                            return;
+                        match c.command(command, now) {
+                            Ok(events) => {
+                                if forward(&tx, events, &c, &mut last_identity) {
+                                    return;
+                                }
+                            }
+                            // Refused (a job runs, a jog out of range…): the panel shows why.
+                            Err(e) => {
+                                let _ = tx.send(Event::Line(format!("Refused: {e}")));
+                            }
                         }
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
-                if let Some(s) = stream.as_mut()
-                    && s.timed_out(Duration::from_secs(15))
-                {
-                    let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                    let _ = tx.send(Event::Disconnected("Job acknowledgement timed out; reconnect and inspect controller before retrying".into()));
+                if forward(&tx, c.poll(now), &c, &mut last_identity) {
                     return;
-                }
-                if let Some(s) = stream.as_mut()
-                    && let Some(line) = s.next_line()
-                {
-                    if let Err(e) = port.write_all(line.as_bytes()) {
-                        s.abort(&format!("Write failed: {e}"));
-                        let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                        let _ = tx.send(Event::Disconnected(e.to_string()));
-                        return;
-                    }
-                    let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                }
-                if last_poll.elapsed() >= Duration::from_millis(500) {
-                    if let Err(e) = port.write_all(b"?") {
-                        let _ = tx.send(Event::Disconnected(format!("Status query failed: {e}")));
-                        return;
-                    }
-                    last_poll = Instant::now();
-                }
-                match port.read(&mut buffer) {
-                    Ok(n) => {
-                        for byte in &buffer[..n] {
-                            if *byte == b'\n' {
-                                let line = String::from_utf8_lossy(&pending).trim().to_string();
-                                pending.clear();
-                                if let Some(s) = stream.as_mut()
-                                    && (line == "ok" || line.starts_with("error:") || line.starts_with("ALARM:"))
-                                {
-                                    s.response(&line);
-                                    let _ = tx.send(Event::JobProgress(s.progress.clone()));
-                                }
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                if line.starts_with('<') {
-                                    let _ = tx.send(Event::Status(parse_status(&line)));
-                                } else {
-                                    let _ = tx.send(Event::Line(line));
-                                }
-                            } else if pending.len() < 4096 {
-                                pending.push(*byte);
-                            } else {
-                                pending.clear();
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(e) => {
-                        let _ = tx.send(Event::Disconnected(format!("Read failed: {e}")));
-                        return;
-                    }
                 }
             }
             let _ = tx.send(Event::Disconnected("Disconnected by user".into()));
@@ -222,38 +146,69 @@ impl Monitor {
         Self { events, commands }
     }
 }
+
+/// Passes the controller's events to the panel; true when the link was lost (the thread ends).
+fn forward<T: Transport>(tx: &Sender<Event>, events: Vec<lasercraft_machine::Event>, c: &Controller<T>, identity: &mut Vec<String>) -> bool {
+    for e in events {
+        match e {
+            lasercraft_machine::Event::Line(line) => {
+                if line.starts_with("[VER:") || line.starts_with("[OPT:") {
+                    identity.push(line.clone());
+                    identity.truncate(16);
+                }
+                let _ = tx.send(Event::Line(line));
+            }
+            lasercraft_machine::Event::Status(s) => {
+                let status = GrblStatus {
+                    state: s.state.label(),
+                    machine_position: s.machine,
+                    work_position: s.work_position(c.offset),
+                    alarm: (s.state == State::Alarm).then(|| "ALARM: unlock ($X) or home ($H) after checking the machine".into()),
+                    identity: identity.clone(),
+                    raw: s.raw.clone(),
+                };
+                let _ = tx.send(Event::Status(status));
+            }
+            lasercraft_machine::Event::JobProgress(p) => {
+                let _ = tx.send(Event::JobProgress(p));
+            }
+            lasercraft_machine::Event::Lost(why) => {
+                let _ = tx.send(Event::Disconnected(why));
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn list_ports() -> Result<Vec<String>, String> {
     serialport::available_ports().map(|ports| ports.into_iter().map(|p| p.port_name).collect()).map_err(|e| e.to_string())
 }
-fn xyz(value: &str) -> Option<[f64; 3]> {
-    let mut parts = value.split(',');
-    Some([parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?])
-}
-pub fn parse_status(line: &str) -> GrblStatus {
-    let mut status = GrblStatus { raw: line.to_string(), ..Default::default() };
-    let content = line.trim().trim_start_matches('<').trim_end_matches('>');
-    for (i, field) in content.split('|').enumerate() {
-        if i == 0 {
-            status.state = field.to_string();
-            continue;
-        }
-        if let Some(value) = field.strip_prefix("MPos:") {
-            status.machine_position = xyz(value);
-        }
-        if let Some(value) = field.strip_prefix("WPos:") {
-            status.work_position = xyz(value);
-        }
-    }
-    status
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lasercraft_machine::sim::SimulatedGrbl;
+
+    /// The controller's events reach the panel as before: status with positions, an alarm state
+    /// flagged, job progress, and a lost link as a disconnect.
     #[test]
-    fn parses_grbl_status() {
-        let s = parse_status("<Idle|MPos:1.000,2.000,3.000|WPos:0.000,1.000,2.000|FS:0,0>");
-        assert_eq!(s.state, "Idle");
-        assert_eq!(s.machine_position, Some([1., 2., 3.]));
-        assert_eq!(s.work_position, Some([0., 1., 2.]));
+    fn controller_events_reach_the_panel() {
+        let (tx, rx) = mpsc::channel();
+        let t = Instant::now();
+        let mut sim = SimulatedGrbl::default();
+        sim.state = "Alarm".into();
+        sim.position = [1.0, 2.0, 0.0];
+        let mut c = Controller::new(sim, StreamMode::LineByLine);
+        let mut identity = vec![];
+        assert!(!forward(&tx, c.poll(t), &c, &mut identity));
+        let Ok(Event::Status(s)) = rx.try_recv() else { panic!("a status") };
+        assert_eq!((s.state.as_str(), s.machine_position), ("Alarm", Some([1.0, 2.0, 0.0])));
+        assert!(s.alarm.is_some());
+        let events = c.command(lasercraft_machine::Command::StartJob("G21\nG90".into()), t).unwrap();
+        assert!(!forward(&tx, events, &c, &mut identity));
+        assert!(matches!(rx.try_recv(), Ok(Event::JobProgress(_))));
+        assert!(forward(&tx, vec![lasercraft_machine::Event::Lost("unplugged".into())], &c, &mut identity));
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Disconnected(w) if w == "unplugged")));
     }
 }

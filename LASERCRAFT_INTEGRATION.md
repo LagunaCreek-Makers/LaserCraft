@@ -93,3 +93,26 @@ or `threshold` burn at full power or not at all; `grayscale` sets each sample's 
 `minPower` and `power` by its darkness. `negative` burns the light parts. Overscan runs at S0 and
 stops at the bed's edges. Images are capped at 16 million samples (40 000 along a side) at the
 chosen interval: a larger one asks for a larger interval instead of allocating it.
+
+## M2: machine control (GRBL)
+
+### The machine crate
+
+`crates/laser-machine` (`lasercraft-machine`, no workspace dependencies, no I/O of its own) holds
+the GRBL 1.1 protocol and job streaming, driven through a `Transport` the caller supplies:
+
+- `grbl`: what a job may hold (`job_lines`: no `$` or real-time commands, lines of at most 70
+  ASCII characters), the real-time bytes, replies (`ok`, `error:N`, `ALARM:N`, status reports with
+  positions, work offset, feed/spindle, buffer, pins and overrides, `$N=` settings, feedback), the
+  meaning of each error and alarm number (in our own words, from GRBL's public interface
+  documentation; no GRBL source, which is GPL), the settings LaserCraft checks (`$30`, `$32`,
+  `$110/111`, `$120/121`, `$130/131`, `$22`), the jog line, and a streamer that sends line by
+  line or by character counting (keeping the 128-byte receive buffer full, never over it).
+- `Controller`: one `poll(now)` at a time (no threads, no clock): status every 500 ms, replies
+  parsed, job lines sent, errors and alarms stop the job with their meaning, an answer missing for
+  15 s or a controller restart fails the job and the link is treated as lost.
+- `sim::SimulatedGrbl`: a scripted controller for tests (receive-buffer overflow detection,
+  rejected, silent and alarming lines, settings, hold/resume/reset).
+
+The desktop app's serial thread runs the controller over the serial port (line by line, as
+before); its old streamer and simulator moved into the crate with their tests.
