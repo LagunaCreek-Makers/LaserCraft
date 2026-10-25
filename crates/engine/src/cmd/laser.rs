@@ -13,6 +13,26 @@ const EXPORT: &str = "laser.exportGcode";
 const SET: &str = "laser.setLayer";
 
 const NO_BED: &str = "no machine bed size: select a machine profile or pass bedWidth/bedHeight";
+/// The machine's motion limits for the time estimate: `maxRate` (mm/min) and `acceleration`
+/// (mm/s²), each a number for both axes or `[x, y]`; the defaults for those not given.
+fn motion(p: &Value) -> Result<lasercraft_machine::grbl::Motion> {
+    let d = lasercraft_machine::grbl::Motion::default();
+    let pair = |key: &str, max: f64, fallback: [f64; 2]| -> Result<[f64; 2]> {
+        let v = match p.get(key) {
+            None | Some(Value::Null) => return Ok(fallback),
+            Some(Value::Array(_)) => finite_numbers::<2>(&p[key]),
+            Some(v) => v.as_f64().map(|n| [n, n]),
+        };
+        v.filter(|v| v.iter().all(|n| n.is_finite() && *n > 0.0 && *n <= max))
+            .ok_or_else(|| bad(EXPORT, format!("{key} must be a positive number (or [x, y]) up to {max}")))
+    };
+    Ok(lasercraft_machine::grbl::Motion {
+        max_rate: pair("maxRate", 1.0e6, d.max_rate)?,
+        acceleration: pair("acceleration", 1.0e6, d.acceleration)?,
+        ..d
+    })
+}
+
 /// Most hook lines (`prologue`, `epilogue`) and their longest line.
 const MAX_HOOK_LINES: usize = 1024;
 const MAX_HOOK_LINE: usize = 120;
@@ -61,7 +81,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Laser G-code",
             [],
             None,
-            "{bedWidth, bedHeight (mm, from the machine profile; art outside the bed is refused), origin?: the machine's corner: bottomLeft (default: x right, y up)|topLeft (x right, y down)|topRight (x left, y down)|bottomRight (x left, y up), maxS?: 1000 (GRBL $30: the S value of 100 % power), path?, selectionOnly?: false, tolerance?: 0.05 (mm curves are flattened to, 0.001 to 5), artboard?: 0 (the bed: the origin is its corner), prologue?: [G-code lines before the job], epilogue?: [lines after it] (the machine's air-assist and accessory hooks: comments, M-codes other than M3/M4, and G4 dwells only; at most 1024 lines of 120 characters)} → {gcode, warnings, contours, operations, path?, bytes?}. GRBL laser-mode G-code (M4 dynamic power, $32=1) of the visible, printable layers' paths, each layer cut with its laser.setLayer settings (bottom layer first, holes before the outlines around them, then nearest first). Review it before running it: nothing is sent to a machine",
+            "{bedWidth, bedHeight (mm, from the machine profile; art outside the bed is refused), origin?: the machine's corner: bottomLeft (default: x right, y up)|topLeft (x right, y down)|topRight (x left, y down)|bottomRight (x left, y up), maxS?: 1000 (GRBL $30: the S value of 100 % power), path?, selectionOnly?: false, tolerance?: 0.05 (mm curves are flattened to, 0.001 to 5), artboard?: 0 (the bed: the origin is its corner), prologue?: [G-code lines before the job], epilogue?: [lines after it], maxRate?: 6000 (mm/min, the machine's fastest move: $110/$111), acceleration?: 1000 (mm/s²: $120/$121) (for the time estimate) (the machine's air-assist and accessory hooks: comments, M-codes other than M3/M4, and G4 dwells only; at most 1024 lines of 120 characters)} → {gcode, warnings, contours, operations, estimate: {seconds, burnMm, travelMm, moves}, path?, bytes?}. The estimate plans the moves with acceleration and corner speeds (look-ahead), rapids at maxRate, dwells included; the real time is somewhat longer. GRBL laser-mode G-code (M4 dynamic power, $32=1) of the visible, printable layers' paths, each layer cut with its laser.setLayer settings (bottom layer first, holes before the outlines around them, then nearest first). Review it before running it: nothing is sent to a machine",
             has_doc,
             export_gcode
         ),
@@ -106,6 +126,7 @@ fn export_gcode(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(EXPORT, "params must be an object"));
     }
     check_numbers(p, &["tolerance", "artboard", "bedWidth", "bedHeight", "maxS"], EXPORT)?;
+    let motion = motion(p)?;
     let origin = match str_param(p, "origin") {
         None => Origin::BottomLeft,
         Some(o) => Origin::parse(o).ok_or_else(|| bad(EXPORT, format!("origin `{o}`: bottomLeft, topLeft, topRight or bottomRight")))?,
@@ -162,6 +183,8 @@ fn export_gcode(s: &mut Session, p: &Value) -> Result<Value> {
         "contours": out.contours,
         "operations": out.job.operations.len(),
     });
+    let e = lasercraft_machine::grbl::estimate(&gcode, &motion);
+    r["estimate"] = json!({ "seconds": e.seconds, "burnMm": e.burn_mm, "travelMm": e.travel_mm, "moves": e.moves });
     if let Some(path) = str_param(p, "path") {
         fileio::write_file(path, gcode.as_bytes())?;
         r["path"] = json!(path);
@@ -434,6 +457,25 @@ mod tests {
         s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap();
         let e = export(&mut s, json!({})).unwrap_err().to_string();
         assert!(e.contains("nothing to cut") && e.contains("Image layers"), "{e}");
+    }
+
+    #[test]
+    fn export_gives_a_time_estimate() {
+        let mut s = session();
+        s.execute("shape.rectangle", &json!({"x": 72, "y": 72, "width": 72, "height": 72})).unwrap();
+        let r = export(&mut s, json!({})).unwrap();
+        let e = &r["estimate"];
+        // A 25.4 mm square at 1000 mm/min: at least 4 × 25.4 mm / (1000 / 60) mm/s.
+        let secs = e["seconds"].as_f64().unwrap();
+        assert!(secs > 4.0 * 25.4 / (1000.0 / 60.0) && secs < 30.0, "{secs}");
+        assert!((e["burnMm"].as_f64().unwrap() - 101.6).abs() < 0.01);
+        assert!(e["travelMm"].as_f64().unwrap() > 0.0);
+        // Gentler acceleration and slower rapids take longer; both axes or [x, y].
+        let slow = export(&mut s, json!({"acceleration": 10, "maxRate": [600, 600]})).unwrap()["estimate"]["seconds"].as_f64().unwrap();
+        assert!(slow > secs, "{slow} vs {secs}");
+        for bad in [json!({"acceleration": 0}), json!({"maxRate": [1, -1]}), json!({"maxRate": "fast"}), json!({"acceleration": [1, 2, 3]})] {
+            assert!(export(&mut s, bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

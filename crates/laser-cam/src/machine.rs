@@ -86,6 +86,10 @@ pub struct MachineProfile {
     pub prologue: Vec<String>,
     /// … and after it.
     pub epilogue: Vec<String>,
+    /// The fastest move (mm/min) and the acceleration (mm/s²), for time estimates (`max_rate`,
+    /// `acceleration`; `None`: not saved).
+    pub max_rate: Option<f64>,
+    pub acceleration: Option<f64>,
 }
 
 impl MachineProfile {
@@ -114,7 +118,19 @@ impl MachineProfile {
         let air: AirConfig = serde_json::from_value(v["air_assist"].clone()).unwrap_or_default();
         let accessories: AccessoryConfig = serde_json::from_value(v["accessories"].clone()).unwrap_or_default();
         let (prologue, epilogue) = job_hooks(&air, AirMode::Inherit, &accessories).map_err(|e| format!("machine `{name}`: {e}"))?;
-        Ok(Self { width_mm: side("width_mm")?, height_mm: side("height_mm")?, max_s, origin, prologue, epilogue, name, controller })
+        let positive = |key: &str| v[key].as_f64().filter(|n| n.is_finite() && *n > 0.0 && *n <= 1.0e6);
+        Ok(Self {
+            width_mm: side("width_mm")?,
+            height_mm: side("height_mm")?,
+            max_s,
+            origin,
+            prologue,
+            epilogue,
+            max_rate: positive("max_rate"),
+            acceleration: positive("acceleration"),
+            name,
+            controller,
+        })
     }
 }
 

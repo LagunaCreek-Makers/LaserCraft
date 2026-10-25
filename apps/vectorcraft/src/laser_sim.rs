@@ -7,7 +7,6 @@ pub struct Step {
     pub y: f64,
     pub z: f64,
     pub laser_on: bool,
-    pub travel: bool,
     pub seconds: f64,
 }
 #[derive(Default)]
@@ -123,16 +122,7 @@ pub fn simulate(source: &str, max_s: f64) -> Simulation {
                         let seconds = if feed > 0.0 { distance / (feed * unit) * 60.0 } else { 0.0 };
                         result.duration_seconds += seconds;
                         let active = laser && power > 0.0 && max_s > 0.0;
-                        result.steps.push(Step {
-                            line: idx + 1,
-                            code: raw.to_string(),
-                            x: ax,
-                            y: ay,
-                            z: az,
-                            laser_on: active,
-                            travel: !active,
-                            seconds,
-                        });
+                        result.steps.push(Step { line: idx + 1, code: raw.to_string(), x: ax, y: ay, z: az, laser_on: active, seconds });
                         (px, py, pz) = (ax, ay, az);
                     }
                     (x, y, z) = (nx, ny, nz);
@@ -147,7 +137,7 @@ pub fn simulate(source: &str, max_s: f64) -> Simulation {
         let seconds = if speed > 0.0 { dist / speed * 60.0 } else { 0.0 };
         result.duration_seconds += seconds;
         let active = motion == 1 && laser && power > 0.0 && max_s > 0.0;
-        result.steps.push(Step { line: idx + 1, code: raw.to_string(), x: nx, y: ny, z: nz, laser_on: active, travel: !active, seconds });
+        result.steps.push(Step { line: idx + 1, code: raw.to_string(), x: nx, y: ny, z: nz, laser_on: active, seconds });
         (x, y, z) = (nx, ny, nz);
     }
     result
@@ -307,36 +297,6 @@ mod phase17_tests {
     }
 }
 
-/// Offline trapezoidal speed estimate. Each move assumes a stop at both ends;
-/// actual controller look-ahead, junction deviation and firmware differ.
-#[derive(Clone, Copy, Debug)]
-pub struct MotionEstimate {
-    pub acceleration_mm_s2: f64,
-    pub rapid_mm_min: f64,
-}
-impl Default for MotionEstimate {
-    fn default() -> Self {
-        Self { acceleration_mm_s2: 500.0, rapid_mm_min: 3000.0 }
-    }
-}
-
-pub fn estimated_motion_time(sim: &Simulation, settings: MotionEstimate) -> f64 {
-    let acceleration = settings.acceleration_mm_s2.max(0.001);
-    let mut previous = (0.0, 0.0, 0.0);
-    let mut total = 0.0;
-    for step in &sim.steps {
-        let distance = ((step.x - previous.0).powi(2) + (step.y - previous.1).powi(2) + (step.z - previous.2).powi(2)).sqrt();
-        let nominal = if step.seconds > 0.0 { distance / step.seconds } else { 0.0 };
-        let vmax = if step.travel { settings.rapid_mm_min.max(1.0) / 60.0 } else { nominal };
-        if distance > 0.0 && vmax > 0.0 {
-            let ramp = vmax * vmax / acceleration;
-            total += if distance >= ramp { 2.0 * vmax / acceleration + (distance - ramp) / vmax } else { 2.0 * (distance / acceleration).sqrt() };
-        }
-        previous = (step.x, step.y, step.z);
-    }
-    total
-}
-
 /// Simple 8-bit raster image to bidirectional GRBL scanlines.
 /// Pixels are row-major, with 0 black and 255 white. Offline output only.
 #[allow(dead_code, reason = "library API from phase 18, not wired to image import yet")]
@@ -382,12 +342,6 @@ mod phase18_tests {
         assert!(code.contains("S1000"));
         assert!(code.contains("S0"));
         assert!(code.contains("G0 X0.1000 Y0.1000"));
-    }
-    #[test]
-    fn motion_estimate_is_longer_with_acceleration() {
-        let sim = simulate("G21 G90\nG1 X100 F6000", 1000.0);
-        let estimate = estimated_motion_time(&sim, MotionEstimate::default());
-        assert!(estimate > sim.duration_seconds);
     }
     #[test]
     fn bad_raster_rejected() {
