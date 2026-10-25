@@ -39,7 +39,6 @@ pub enum Command {
     Resume,
     Jog { axis: char, distance_mm: f64, feed_mm_min: f64 },
     StartJob(String),
-    CancelJob,
     Stop,
     Unlock,
     Home,
@@ -101,9 +100,6 @@ impl Monitor {
     pub fn start_job(&self, code: String) -> Result<(), String> {
         lasercraft_machine::grbl::job_lines(&code)?;
         self.commands.send(Command::StartJob(code)).map_err(|e| e.to_string())
-    }
-    pub fn cancel_job(&self) {
-        let _ = self.commands.send(Command::CancelJob);
     }
     /// Stop: feed hold, then a soft reset once halted (the laser goes off).
     pub fn stop(&self) {
@@ -184,7 +180,6 @@ impl Monitor {
                             Command::Resume => lasercraft_machine::Command::Resume,
                             Command::Jog { axis, distance_mm, feed_mm_min } => lasercraft_machine::Command::Jog { axis, distance_mm, feed_mm_min },
                             Command::StartJob(code) => lasercraft_machine::Command::StartJob(code),
-                            Command::CancelJob => lasercraft_machine::Command::CancelJob,
                             Command::Stop => lasercraft_machine::Command::Stop,
                             Command::Unlock => lasercraft_machine::Command::Unlock,
                             Command::Home => lasercraft_machine::Command::Home,
