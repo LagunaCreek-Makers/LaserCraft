@@ -33,6 +33,28 @@ persistent clients can send further requests within these bounds, or reconnect a
 These transport budgets are separate from the existing 60-second command-processing wait.
 Transport: `apps/vectorcraft/src/control_server.rs`.
 
+## LaserCraft machine requests
+
+The desktop app answers `laser.machine.*` methods from its laser panel (they never reach the
+editor):
+
+| Method | Params | Result |
+|---|---|---|
+| `laser.machine.status` | — | `{connected, link: serial\|simulator\|null, state, position, workPosition, alarm, job: {sent, acknowledged, total, failed, finished}\|null, log}` |
+| `laser.machine.connect` | `simulator?: false`, `port?` (default the panel's), `baud?` | the status |
+| `laser.machine.disconnect`, `readSettings`, `hold`, `stop` | — | `{sent, link}` |
+| `laser.machine.resume`, `home`, `unlock` | — | `{sent, link}` (simulator only) |
+| `laser.machine.jog` | `axis` (x, y, z), `distance` (mm, ±10), `feed?` (mm/min, 1–1000; 600) | `{sent, link}` (simulator only) |
+| `laser.machine.start` | `gcode?` (default the panel's generated job) | `{sent, link}` (simulator only; the job's preflight still applies) |
+
+The rule (from the project owner): **machine motion is panel-only.** On a real machine (a
+serial port), automation may only `connect`, `disconnect`, read `status`, `readSettings` (`$$`,
+read-only), `hold` and `stop`. `resume`, `jog`, `home`, `unlock` and `start` are refused with
+"machine motion is panel-only", and nothing (no param, no setting) turns them on: the desktop app
+decides from how the link was opened (the serial port or the built-in simulator), never from the
+request. On the simulator (`connect {simulator: true}`) automation may drive everything, so
+tests and CI cover the whole job lifecycle.
+
 ## Synthetic input budgets
 
 `ui.drag` accepts at most **256** `steps`; `ui.click` and `ui.drag` accept at most **16** `count`.

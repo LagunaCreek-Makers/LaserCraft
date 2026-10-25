@@ -3,7 +3,7 @@ use crate::accessories::{Accessory, AccessoryConfig, AccessoryMode, AccessoryTra
 use crate::accessory_lifecycle::{Coordinator, Stage};
 use crate::accessory_macros::{MacroAction, MacroConfig, MacroEvent, MacroRule};
 use crate::air_assist::{AirConfig, AirMode};
-use crate::grbl_monitor::{self, Event, GrblStatus, Monitor};
+use crate::grbl_monitor::{self, Event, GrblStatus, Link, Monitor};
 use crate::grbl_stream::Progress;
 use crate::laser_doc::{self, Bed, DocExport};
 use crate::laser_sim;
@@ -343,10 +343,9 @@ impl LaserPanel {
         self.sim_playing = false;
         self.message = "Job made from the document; inspect it in the dry run. Not sent to the controller.".into();
     }
-    pub fn show(&mut self, ctx: &egui::Context, run: &mut laser_doc::Run) {
-        if !self.open {
-            return;
-        }
+    /// Takes what the machine's monitor reported since last time (status, lines, job progress, a
+    /// disconnect).
+    fn drain_monitor(&mut self) {
         let mut disconnected = false;
         if let Some(monitor) = &self.monitor {
             for event in monitor.events.try_iter().take(128) {
@@ -377,6 +376,94 @@ impl LaserPanel {
             self.monitor = None;
             self.coordinator.shutdown();
         }
+    }
+
+    /// A machine request from automation (the control channel; MCP has no machine tools). The
+    /// rule (Paul's: machine motion is panel-only): on a real machine, automation may only
+    /// connect, disconnect, read status and settings, hold and stop; everything that moves the
+    /// machine or fires the laser (resume, jog, home, unlock, start) is refused. On the built-in
+    /// simulator, automation may drive everything. Which one is connected is decided when it is
+    /// opened, never by a request.
+    pub fn automation(&mut self, method: &str, p: &Value) -> Result<Value, String> {
+        const PANEL_ONLY: &str =
+            "machine motion is panel-only: on a real machine, automation may only connect, disconnect, read status and settings, hold and stop";
+        self.drain_monitor();
+        let Some(name) = method.strip_prefix("laser.machine.") else { return Err(format!("unknown machine request `{method}`")) };
+        let moves = matches!(name, "resume" | "jog" | "home" | "unlock" | "start");
+        match name {
+            "status" => Ok(self.machine_status_json()),
+            "connect" => {
+                if self.monitor.is_some() {
+                    return Err("a machine is already connected: disconnect first".into());
+                }
+                let expect =
+                    lasercraft_machine::grbl::Expect { max_s: Some(f64::from(self.max_s)), bed: Some((self.machine_width, self.machine_height)) };
+                if p["simulator"].as_bool() == Some(true) {
+                    self.monitor = Some(Monitor::connect_simulator(expect));
+                } else {
+                    let port = p["port"].as_str().map(str::to_owned).unwrap_or_else(|| self.connection_port.clone());
+                    if port.trim().is_empty() {
+                        return Err("no serial port: pass `port`, or `simulator: true`".into());
+                    }
+                    let baud = p["baud"]
+                        .as_u64()
+                        .and_then(|b| u32::try_from(b).ok())
+                        .filter(|b| (1200..=1_000_000).contains(b))
+                        .unwrap_or(self.connection_baud);
+                    self.monitor = Some(Monitor::connect(port, baud, expect));
+                }
+                Ok(self.machine_status_json())
+            }
+            _ => {
+                let Some(m) = &self.monitor else { return Err("no machine is connected".into()) };
+                if moves && m.link() != Link::Simulator {
+                    return Err(PANEL_ONLY.into());
+                }
+                match name {
+                    "disconnect" => m.disconnect(),
+                    "readSettings" => m.settings(),
+                    "hold" => m.hold(),
+                    "stop" => m.stop(),
+                    "resume" => m.resume(),
+                    "home" => m.home(),
+                    "unlock" => m.unlock(),
+                    "jog" => {
+                        let axis = p["axis"].as_str().and_then(|a| a.chars().next()).ok_or("jog needs `axis` (x, y or z)")?;
+                        let distance = p["distance"].as_f64().ok_or("jog needs `distance` (mm)")?;
+                        m.jog(axis, distance, p["feed"].as_f64().unwrap_or(600.0))?;
+                    }
+                    "start" => {
+                        let code = p["gcode"].as_str().map(str::to_owned).unwrap_or_else(|| self.generated_gcode.clone());
+                        m.start_job(code)?;
+                    }
+                    other => return Err(format!("unknown machine request `laser.machine.{other}`")),
+                }
+                Ok(json!({ "sent": name, "link": m.link().id() }))
+            }
+        }
+    }
+
+    fn machine_status_json(&self) -> Value {
+        let s = &self.monitor_status;
+        json!({
+            "connected": self.monitor.is_some(),
+            "link": self.monitor.as_ref().map(|m| m.link().id()),
+            "state": s.state,
+            "position": s.machine_position,
+            "workPosition": s.work_position,
+            "alarm": s.alarm,
+            "job": self.stream_progress.as_ref().map(|p| json!({
+                "sent": p.sent, "acknowledged": p.acknowledged, "total": p.total, "failed": p.failed, "finished": p.finished,
+            })),
+            "log": self.monitor_log.iter().rev().take(20).rev().collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, run: &mut laser_doc::Run) {
+        if !self.open {
+            return;
+        }
+        self.drain_monitor();
         if let Some(result) = self.coordinator.poll() {
             match result {
                 Ok(()) if self.coordinator.stage == Stage::Ready => {
@@ -1218,6 +1305,83 @@ mod tests {
         // Refused settings are an error, not a job without them.
         p.air_config.on_command = "G1 X5; M8".into();
         assert!(p.bed().is_err());
+    }
+
+    /// Asks `method` until `done` holds for its result (the monitor's thread answers in its own
+    /// time), for up to 5 s.
+    fn until(p: &mut LaserPanel, method: &str, done: impl Fn(&Value) -> bool) -> Value {
+        let start = std::time::Instant::now();
+        loop {
+            let v = p.automation(method, &json!({})).unwrap();
+            if done(&v) || start.elapsed() > std::time::Duration::from_secs(5) {
+                return v;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// On the simulator, automation drives the whole lifecycle: connect, status, jog, home,
+    /// unlock, start a job and see it finish, stop, disconnect.
+    #[test]
+    fn automation_drives_the_simulator() {
+        let mut p = LaserPanel { monitor: None, ..LaserPanel::default() };
+        assert!(p.automation("laser.machine.jog", &json!({"axis": "x", "distance": 1})).unwrap_err().contains("no machine"));
+        let r = p.automation("laser.machine.connect", &json!({"simulator": true})).unwrap();
+        assert_eq!(r["link"], "simulator");
+        assert!(p.automation("laser.machine.connect", &json!({"simulator": true})).is_err(), "already connected");
+        let s = until(&mut p, "laser.machine.status", |v| v["state"] == "Idle");
+        assert_eq!(s["state"], "Idle");
+        for (method, params) in [
+            ("laser.machine.jog", json!({"axis": "x", "distance": 2, "feed": 300})),
+            ("laser.machine.home", json!({})),
+            ("laser.machine.unlock", json!({})),
+            ("laser.machine.readSettings", json!({})),
+        ] {
+            assert_eq!(p.automation(method, &params).unwrap()["link"], "simulator", "{method}");
+        }
+        until(&mut p, "laser.machine.status", |v| v["state"] == "Idle");
+        p.automation("laser.machine.start", &json!({"gcode": "G21\nG90\nG0 X5 Y5\nM4 S100\nG1 X10 F600\nM5"})).unwrap();
+        let s = until(&mut p, "laser.machine.status", |v| v["job"]["finished"] == true);
+        assert_eq!(s["job"]["acknowledged"], 6, "{s}");
+        p.automation("laser.machine.hold", &json!({})).unwrap();
+        p.automation("laser.machine.stop", &json!({})).unwrap();
+        p.automation("laser.machine.disconnect", &json!({})).unwrap();
+        until(&mut p, "laser.machine.status", |v| v["connected"] == false);
+        assert!(p.automation("laser.other", &json!({})).is_err());
+        assert!(p.automation("laser.machine.fly", &json!({})).is_err());
+    }
+
+    /// On a real machine (a serial link; here the simulator stands behind a monitor opened as
+    /// serial), automation may only read, hold and stop: every motion request is refused, and no
+    /// param changes that.
+    #[test]
+    fn automation_cannot_move_a_real_machine() {
+        let expect = lasercraft_machine::grbl::Expect::default();
+        let real = Monitor::spawn(Link::Serial, expect, || {
+            Ok(Box::new(lasercraft_machine::sim::SimulatedGrbl::default()) as Box<dyn lasercraft_machine::Transport + Send>)
+        });
+        let mut p = LaserPanel { monitor: Some(real), ..LaserPanel::default() };
+        until(&mut p, "laser.machine.status", |v| v["state"] == "Idle");
+        assert_eq!(p.automation("laser.machine.status", &json!({})).unwrap()["link"], "serial");
+        for (method, params) in [
+            ("laser.machine.jog", json!({"axis": "x", "distance": 1})),
+            ("laser.machine.home", json!({})),
+            ("laser.machine.unlock", json!({})),
+            ("laser.machine.resume", json!({})),
+            ("laser.machine.start", json!({"gcode": "G21\nG0 X1"})),
+            // Asking for the simulator, or claiming to be the panel, changes nothing.
+            ("laser.machine.start", json!({"gcode": "G21\nG0 X1", "simulator": true, "link": "simulator", "panel": true})),
+            ("laser.machine.jog", json!({"axis": "x", "distance": 1, "allowMotion": true})),
+        ] {
+            let e = p.automation(method, &params).unwrap_err();
+            assert!(e.contains("panel-only"), "{method}: {e}");
+        }
+        for method in ["laser.machine.readSettings", "laser.machine.hold", "laser.machine.stop"] {
+            assert_eq!(p.automation(method, &json!({})).unwrap()["link"], "serial", "{method}");
+        }
+        // Nothing reached the controller: no job ever started.
+        assert!(p.automation("laser.machine.status", &json!({})).unwrap()["job"].is_null());
+        p.automation("laser.machine.disconnect", &json!({})).unwrap();
     }
 
     fn unloaded() -> LaserPanel {

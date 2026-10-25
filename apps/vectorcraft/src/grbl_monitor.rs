@@ -48,6 +48,25 @@ pub enum Command {
 pub struct Monitor {
     pub events: Receiver<Event>,
     commands: Sender<Command>,
+    link: Link,
+}
+
+/// What a monitor talks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// A real machine on a serial port: automation may not move it (panel only).
+    Serial,
+    /// The built-in simulator: nothing physical, automation may drive it.
+    Simulator,
+}
+
+impl Link {
+    pub fn id(self) -> &'static str {
+        match self {
+            Link::Serial => "serial",
+            Link::Simulator => "simulator",
+        }
+    }
 }
 
 /// The serial port as the controller's link (reads time out quickly: nothing arrived).
@@ -103,20 +122,42 @@ impl Monitor {
     }
     /// Opens `port_name`; jobs are checked against `expect` (the machine profile) before they start.
     pub fn connect(port_name: String, baud: u32, expect: Expect) -> Self {
+        Self::spawn(Link::Serial, expect, move || {
+            serialport::new(&port_name, baud)
+                .timeout(Duration::from_millis(120))
+                .open()
+                .map(|p| Box::new(Serial(p)) as Box<dyn Transport + Send>)
+                .map_err(|e| format!("Open failed: {e}"))
+        })
+    }
+
+    /// The built-in GRBL simulator instead of a machine: nothing physical moves, so automation
+    /// may drive it fully (tests, demos, CI).
+    pub fn connect_simulator(expect: Expect) -> Self {
+        Self::spawn(Link::Simulator, expect, || Ok(Box::new(lasercraft_machine::sim::SimulatedGrbl::default()) as Box<dyn Transport + Send>))
+    }
+
+    /// What this monitor is linked to (decided when it was opened, never by a request).
+    pub fn link(&self) -> Link {
+        self.link
+    }
+
+    /// Runs the controller over what `open` gives, on its own thread.
+    pub(crate) fn spawn(link: Link, expect: Expect, open: impl FnOnce() -> Result<Box<dyn Transport + Send>, String> + Send + 'static) -> Self {
         let (tx, events) = mpsc::channel();
         let (commands, rx) = mpsc::channel();
         thread::spawn(move || {
-            let port = match serialport::new(&port_name, baud).timeout(Duration::from_millis(120)).open() {
-                Ok(p) => p,
+            let transport = match open() {
+                Ok(t) => t,
                 Err(e) => {
-                    let _ = tx.send(Event::Disconnected(format!("Open failed: {e}")));
+                    let _ = tx.send(Event::Disconnected(e));
                     return;
                 }
             };
             let _ = tx.send(Event::Connected);
             // One line at a time: nothing is queued in the controller unseen. The controller
             // asks for status ('?', read-only) itself; connecting doesn't reset the machine.
-            let mut c = Controller::new(Serial(port), StreamMode::LineByLine);
+            let mut c = Controller::new(transport, StreamMode::LineByLine);
             c.expect = expect;
             // The settings (read only) let jobs be checked before they start: laser mode,
             // power range, travel.
@@ -167,10 +208,14 @@ impl Monitor {
                 if forward(&tx, c.poll(now), &c, &mut last_identity) {
                     return;
                 }
+                // A serial read waits for its timeout; the simulator answers at once.
+                if link == Link::Simulator {
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
             let _ = tx.send(Event::Disconnected("Disconnected by user".into()));
         });
-        Self { events, commands }
+        Self { events, commands, link }
     }
 }
 

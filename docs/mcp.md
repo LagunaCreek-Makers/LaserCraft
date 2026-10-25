@@ -273,6 +273,10 @@ one line in, one reply out, no threads.
   them means being able to suspend a tool call mid-flight, which is what the `2026-07-28` revision's
   input-requests mechanism exists for.
 - **Streamable HTTP / SSE.** stdio only.
+- **LaserCraft machine control.** MCP has no machine tools: an agent can make laser jobs from the
+  document (`laser.exportGcode` through `command_run`) but can't connect to, move or start a
+  machine. The control channel's `laser.machine.*` methods (see `docs/control-protocol.md`) only
+  read, hold and stop a real machine; machine motion is panel-only.
 
 `completion/complete` covers the "what could I pass here" half of the same problem, which is why it
 is here and subscriptions are not.
