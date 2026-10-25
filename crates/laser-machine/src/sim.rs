@@ -75,7 +75,9 @@ impl SimulatedGrbl {
         if let Some((at, alarm)) = self.alarm_at
             && at == n
         {
+            // An alarm stops everything: the lines waiting in the buffer are dropped.
             self.state = "Alarm".into();
+            self.rx.clear();
             self.say(&format!("ALARM:{alarm}"));
             return;
         }

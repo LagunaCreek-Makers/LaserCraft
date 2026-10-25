@@ -116,3 +116,15 @@ the GRBL 1.1 protocol and job streaming, driven through a `Transport` the caller
 
 The desktop app's serial thread runs the controller over the serial port (line by line, as
 before); its old streamer and simulator moved into the crate with their tests.
+
+### Safety gates and the job lifecycle
+
+A job starts only when the controller's last status (no older than 2 s) says Idle, with no alarm,
+no open door (state or door input), no feed hold, not asleep or in check mode. When the settings
+are known (the desktop app reads `$$` on connecting), laser mode must be on (`$32=1`), the job
+must fit the machine's travel (`$130`/`$131`), and a full-power value (`$30`) other than the
+profile's maxS is a warning. The job must also stay on the bed the profile gives. **Stop** sends a
+feed hold, then a soft reset once the machine has halted (or after 1.5 s): the laser goes off and
+the buffers are cleared. **Resume** works only while the machine is held. **Unlock** (`$X`) and
+**Home** (`$H`) are refused during a job; the panel enables them only with motion enabled. None
+of this replaces a hardware emergency stop or interlocks.
