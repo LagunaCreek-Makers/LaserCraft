@@ -75,6 +75,8 @@ pub struct LayerRow {
     pub dither: Dither,
     pub min_power: f64,
     pub negative: bool,
+    /// Image: pixels per inch along each line (`None`: one per line interval).
+    pub dpi: Option<f64>,
     /// The layer has settings of its own (else it cuts with its parent's or the defaults).
     pub custom: bool,
 }
@@ -97,6 +99,7 @@ impl LayerRow {
             dither: v["dither"].as_str().and_then(Dither::parse).unwrap_or_default(),
             min_power: v["minPower"].as_f64().unwrap_or(0.0),
             negative: v["negative"].as_bool().unwrap_or(false),
+            dpi: v["dpi"].as_f64(),
             custom: v["custom"].as_bool().unwrap_or(false),
         })
     }
@@ -116,6 +119,7 @@ impl LayerRow {
             "dither": self.dither.id(),
             "minPower": self.min_power,
             "negative": self.negative,
+            "dpi": self.dpi,
         })
     }
 }
@@ -314,6 +318,15 @@ impl DocExport {
                         ui.horizontal(|ui| {
                             changed |= ui.checkbox(&mut e.bidirectional, "Both ways").changed();
                             changed |= ui.checkbox(&mut e.negative, "Negative").changed();
+                            // DPI along the lines, apart from the line interval (off: one pixel per line).
+                            let mut own = e.dpi.is_some();
+                            if ui.checkbox(&mut own, "DPI").changed() {
+                                e.dpi = own.then(|| (25.4 / e.interval).clamp(10.0, 2540.0).round());
+                                changed = true;
+                            }
+                            if let Some(dpi) = e.dpi.as_mut() {
+                                changed |= ui.add(egui::DragValue::new(dpi).range(10.0..=2540.0).speed(1.0)).changed();
+                            }
                         });
                         ui.end_row();
                     }
@@ -516,10 +529,21 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut d = DocExport::default();
         d.refresh_layers(&mut runner(&mut s));
-        let row = LayerRow { mode: LaserMode::Image, dither: Dither::Grayscale, interval: 1.0, min_power: 5.0, power: 50.0, ..d.layers[0].clone() };
+        let row = LayerRow {
+            mode: LaserMode::Image,
+            dither: Dither::Grayscale,
+            interval: 1.0,
+            min_power: 5.0,
+            power: 50.0,
+            dpi: Some(50.8),
+            ..d.layers[0].clone()
+        };
         d.apply_layer(&mut runner(&mut s), &row);
         assert!(d.error.is_none(), "{:?}", d.error);
-        assert_eq!((d.layers[0].mode, d.layers[0].dither, d.layers[0].min_power), (LaserMode::Image, Dither::Grayscale, 5.0));
+        assert_eq!(
+            (d.layers[0].mode, d.layers[0].dither, d.layers[0].min_power, d.layers[0].dpi),
+            (LaserMode::Image, Dither::Grayscale, 5.0, Some(50.8))
+        );
         let g = d.generate(&mut runner(&mut s), Some(&BED), None).unwrap();
         // 25 rows across the 25.4 mm image; the rectangle on the same layer is left out.
         assert_eq!(g.contours, 25);

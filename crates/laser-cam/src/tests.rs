@@ -611,3 +611,36 @@ fn image_sample_counts_are_capped() {
     let back: Document = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
     assert_eq!(layer_settings(&back).get(&layer), Some(&ok));
 }
+
+#[test]
+fn image_dpi_sets_the_pixel_size_along_the_lines() {
+    let d = image_doc(64, 32, Affine::translate((72.0, 72.0)) * Affine::scale(72.0 / 64.0));
+    let base = LayerSettings { interval_mm: 1.0, dither: Dither::Grayscale, bidirectional: false, ..LayerSettings::default() };
+    // Steps along a row: one Cut per run of equal power, so finer pixels make more of them.
+    let cuts = |s: LayerSettings| -> (usize, usize) {
+        let j = document_to_job(&d, &image_layer(s)).unwrap();
+        (j.contours, j.job.operations.iter().filter(|o| matches!(o, Operation::Cut { .. })).count())
+    };
+    let (rows, coarse) = cuts(base);
+    // 254 DPI is 0.1 mm pixels: ten times finer along the line, the same lines.
+    let (rows_fine, fine) = cuts(LayerSettings { dpi: Some(254.0), ..base });
+    assert_eq!(rows, rows_fine);
+    assert!(fine > coarse * 2, "{fine} vs {coarse}");
+    // No DPI: the pixel is the line interval (settings saved before DPI existed).
+    assert_eq!(base.pixel_mm(), 1.0);
+    assert_eq!(LayerSettings { dpi: Some(25.4), ..base }.pixel_mm(), 1.0);
+    let mut doc_ = doc();
+    let layer = doc_.layers[0].id;
+    doc_.unknown.insert(LAYER_SETTINGS_KEY.into(), serde_json::json!({ layer.0.to_string(): { "mode": "image", "interval": 0.2 } }));
+    assert_eq!(layer_settings(&doc_)[&layer].dpi, None);
+    let s = LayerSettings { mode: LaserMode::Image, dpi: Some(508.0), ..LayerSettings::default() };
+    set_layer_settings(&mut doc_, layer, Some(s)).unwrap();
+    let back: Document = serde_json::from_str(&serde_json::to_string(&doc_).unwrap()).unwrap();
+    assert_eq!(layer_settings(&back)[&layer].dpi, Some(508.0));
+    for bad in [1.0, 5000.0, f64::NAN] {
+        assert!(set_layer_settings(&mut doc_, layer, Some(LayerSettings { dpi: Some(bad), ..s })).is_err(), "{bad}");
+    }
+    // The sample caps hold for DPI too: 2540 DPI over the whole board.
+    let big = image_doc(8, 8, Affine::scale(90.0));
+    assert!(document_to_job(&big, &image_layer(LayerSettings { dpi: Some(2540.0), interval_mm: 0.05, ..LayerSettings::default() })).is_err());
+}

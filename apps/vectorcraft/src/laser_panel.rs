@@ -18,28 +18,13 @@ use lasercraft_core::{Job, Machine, Operation, Point};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Line,
-    Fill,
-    FillLine,
-    Image,
-}
-impl Mode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Line => "Line",
-            Self::Fill => "Fill",
-            Self::FillLine => "Fill + Line",
-            Self::Image => "Image",
-        }
-    }
-}
+/// A cut preset: the speed, power, passes, interval and air assist the
+/// calibration tests, the fill preview and the diagnostic square use (and material presets
+/// save). Layer modes for the document are set in its layer table, not here.
 struct LaserLayer {
     name: String,
     color: Color32,
     enabled: bool,
-    mode: Mode,
     speed: f64,
     power: f64,
     passes: u32,
@@ -48,17 +33,7 @@ struct LaserLayer {
 }
 impl LaserLayer {
     fn new(name: &str, color: Color32) -> Self {
-        Self {
-            name: name.into(),
-            color,
-            enabled: true,
-            mode: Mode::Line,
-            speed: 1200.0,
-            power: 35.0,
-            passes: 1,
-            interval: 0.10,
-            air: AirMode::Inherit,
-        }
+        Self { name: name.into(), color, enabled: true, speed: 1200.0, power: 35.0, passes: 1, interval: 0.10, air: AirMode::Inherit }
     }
 }
 pub struct LaserPanel {
@@ -76,10 +51,8 @@ pub struct LaserPanel {
     /// The job made from the document and its layers' settings.
     doc_export: DocExport,
     message: String,
-    svg_source: String,
     generated_gcode: String,
     preview: Option<Job>,
-    color_mapping: bool,
     profiles: Vec<Value>,
     materials: Vec<Value>,
     active_profile: usize,
@@ -144,10 +117,8 @@ impl Default for LaserPanel {
             loaded_profile: None,
             doc_export: DocExport::default(),
             message: "Offline mode — no laser is connected".into(),
-            svg_source: String::new(),
             generated_gcode: String::new(),
             preview: None,
-            color_mapping: false,
             profiles: vec![],
             materials: vec![],
             active_profile: 0,
@@ -483,19 +454,19 @@ impl LaserPanel {
         egui::Window::new("LaserCraft | Laser Operations").open(&mut open).default_width(350.0).resizable(true).show(ctx,|ui|{
    egui::CollapsingHeader::new("Document → laser job").default_open(true).show(ui,|ui|self.document_section(ui,run));
    ui.separator();
-   ui.horizontal(|ui| {ui.heading("Panel cut layers"); if ui.button("+ Add").clicked(){let idx=self.layers.len();self.layers.push(LaserLayer::new(&format!("C{idx:02}"),Color32::LIGHT_BLUE));self.selected=idx;}});
+   ui.horizontal(|ui| {ui.heading("Cut presets"); if ui.button("+ Add").clicked(){let idx=self.layers.len();self.layers.push(LaserLayer::new(&format!("C{idx:02}"),Color32::LIGHT_BLUE));self.selected=idx;}});
    egui::ScrollArea::vertical().max_height(190.0).show(ui,|ui|{
-    for (i,layer) in self.layers.iter_mut().enumerate(){ui.horizontal(|ui|{ui.checkbox(&mut layer.enabled,"");let (rect,_)=ui.allocate_exact_size(egui::vec2(16.0,16.0),egui::Sense::hover());ui.painter().rect_filled(rect,2.0,layer.color);if ui.selectable_label(self.selected==i,&layer.name).clicked(){self.selected=i;}ui.label(layer.mode.label());});}
+    for (i,layer) in self.layers.iter_mut().enumerate(){ui.horizontal(|ui|{ui.checkbox(&mut layer.enabled,"");let (rect,_)=ui.allocate_exact_size(egui::vec2(16.0,16.0),egui::Sense::hover());ui.painter().rect_filled(rect,2.0,layer.color);if ui.selectable_label(self.selected==i,&layer.name).clicked(){self.selected=i;}});}
    });
    ui.separator();
    if self.selected<self.layers.len(){
     let layer=&mut self.layers[self.selected];
     ui.horizontal(|ui|{ui.label("Layer");ui.text_edit_singleline(&mut layer.name);});
-    ui.horizontal_wrapped(|ui|{ui.label("Mode");for mode in [Mode::Line,Mode::Fill,Mode::FillLine,Mode::Image]{ui.selectable_value(&mut layer.mode,mode,mode.label());}});
+    ui.small("For calibration tests, the fill preview and diagnostics. The document's layers get their Line, Fill or Image mode in Document → laser job.");
     ui.add(egui::Slider::new(&mut layer.speed,1.0..=30000.0).text("Speed (mm/min)"));
     ui.add(egui::Slider::new(&mut layer.power,0.0..=100.0).text("Power (%)"));
     ui.add(egui::Slider::new(&mut layer.passes,1..=100).text("Passes"));
-    if layer.mode!=Mode::Line {ui.add(egui::Slider::new(&mut layer.interval,0.025..=1.0).text("Line interval (mm)"));}
+    ui.add(egui::Slider::new(&mut layer.interval,0.025..=1.0).text("Line interval (mm), fill preview"));
     egui::ComboBox::from_id_salt("layer_air_assist").selected_text(format!("Air assist: {}",layer.air.label())).show_ui(ui,|ui|{for v in [AirMode::Inherit,AirMode::On,AirMode::Off]{ui.selectable_value(&mut layer.air,v,v.label());}});
     if ui.button("Remove selected layer").clicked() && self.layers.len()>1 {self.layers.remove(self.selected);self.selected=self.selected.min(self.layers.len()-1);}
    }
@@ -972,26 +943,12 @@ impl LaserPanel {
     }
    });
    ui.separator();
-   ui.collapsing("Legacy | Pasted SVG → laser toolpaths (offline)",|ui|{
-    ui.small("Legacy: use Document → laser job instead. This path ignores the machine's origin (SVG coordinates are taken as machine millimetres). Paste SVG markup exported from VectorCraft. Straight paths, cubic/quadratic curves, circles, ellipses, lines, rectangles and polygons supported; transforms and arcs are rejected rather than silently cut incorrectly. Coordinates must be in mm.");
-    ui.checkbox(&mut self.color_mapping,"Match SVG stroke colors to operation layers (hex RGB)");
-    ui.add(egui::TextEdit::multiline(&mut self.svg_source).desired_rows(5).hint_text("<svg>...</svg>"));
-    if ui.button("Generate GRBL from SVG").clicked(){
-      let layer=&self.layers[self.selected];
-      if !layer.enabled && !self.color_mapping {self.message="Selected layer is disabled".into();}
-      else if layer.mode!=Mode::Line && !self.color_mapping {self.message="Only Line mode is supported for SVG CAM in this phase".into();}
-      else {let parsed=if self.color_mapping {lasercraft_core::layer_cam::colored_svg_to_job(&self.svg_source,&self.layers.iter().map(|l|lasercraft_core::layer_cam::ColorOperation{color:format!("#{:02x}{:02x}{:02x}",l.color.r(),l.color.g(),l.color.b()),enabled:l.enabled,speed:l.speed,power:l.power,passes:l.passes}).collect::<Vec<_>>())}else{lasercraft_core::svg_cam::svg_to_job(&self.svg_source,layer.speed,layer.power,layer.passes)};match parsed{
-        Ok(job)=>match job.to_grbl(Machine{width_mm:self.machine_width,height_mm:self.machine_height,max_s:self.max_s}){
-          Ok(gcode)=>{self.preview=Some(job);self.generated_gcode=match self.air_config.apply(&gcode,layer.air).and_then(|code|self.accessory_config.apply(&code)){Ok(code)=>code,Err(e)=>{self.message=e;return;}};self.message="SVG converted and bed bounds checked; review output before use".into();},
-          Err(e)=>self.message=format!("Toolpath validation failed: {e:?}")
-        },Err(e)=>self.message=format!("SVG conversion failed: {e:?}")
-      }}
-    }
+   ui.collapsing("Generated G-code",|ui|{
     if !self.generated_gcode.is_empty(){
       ui.label(format!("Generated {} bytes of G-code",self.generated_gcode.len()));
       if ui.button("Copy generated G-code").clicked(){ctx.copy_text(self.generated_gcode.clone());}
       egui::ScrollArea::vertical().max_height(100.0).show(ui,|ui|{ui.add(egui::TextEdit::multiline(&mut self.generated_gcode).desired_rows(5));});
-    }
+    } else {ui.small("Generate a job from the document (or a calibration test) to see its G-code here.");}
    });
    ui.separator();
    ui.collapsing("Phase 5 | Fill engraving preview",|ui|{
