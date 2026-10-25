@@ -2,7 +2,7 @@
 //! port, so the egui thread never blocks. The protocol, streaming and their tests live in
 //! `lasercraft-machine`; this is the port, the thread and the messages to and from the panel.
 use crate::grbl_stream::Progress;
-use lasercraft_machine::grbl::{State, StreamMode};
+use lasercraft_machine::grbl::{Expect, State, StreamMode};
 use lasercraft_machine::{Controller, Transport};
 use std::{
     sync::mpsc::{self, Receiver, Sender},
@@ -40,6 +40,9 @@ pub enum Command {
     Jog { axis: char, distance_mm: f64, feed_mm_min: f64 },
     StartJob(String),
     CancelJob,
+    Stop,
+    Unlock,
+    Home,
 }
 
 pub struct Monitor {
@@ -83,10 +86,23 @@ impl Monitor {
     pub fn cancel_job(&self) {
         let _ = self.commands.send(Command::CancelJob);
     }
+    /// Stop: feed hold, then a soft reset once halted (the laser goes off).
+    pub fn stop(&self) {
+        let _ = self.commands.send(Command::Stop);
+    }
+    /// `$X`: clear an alarm lock.
+    pub fn unlock(&self) {
+        let _ = self.commands.send(Command::Unlock);
+    }
+    /// `$H`: home the machine (it moves).
+    pub fn home(&self) {
+        let _ = self.commands.send(Command::Home);
+    }
     pub fn disconnect(&self) {
         let _ = self.commands.send(Command::Disconnect);
     }
-    pub fn connect(port_name: String, baud: u32) -> Self {
+    /// Opens `port_name`; jobs are checked against `expect` (the machine profile) before they start.
+    pub fn connect(port_name: String, baud: u32, expect: Expect) -> Self {
         let (tx, events) = mpsc::channel();
         let (commands, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -101,6 +117,14 @@ impl Monitor {
             // One line at a time: nothing is queued in the controller unseen. The controller
             // asks for status ('?', read-only) itself; connecting doesn't reset the machine.
             let mut c = Controller::new(Serial(port), StreamMode::LineByLine);
+            c.expect = expect;
+            // The settings (read only) let jobs be checked before they start: laser mode,
+            // power range, travel.
+            if let Ok(events) = c.command(lasercraft_machine::Command::Settings, Instant::now())
+                && forward(&tx, events, &c, &mut vec![])
+            {
+                return;
+            }
             let mut last_identity = vec![];
             loop {
                 let now = Instant::now();
@@ -120,6 +144,9 @@ impl Monitor {
                             Command::Jog { axis, distance_mm, feed_mm_min } => lasercraft_machine::Command::Jog { axis, distance_mm, feed_mm_min },
                             Command::StartJob(code) => lasercraft_machine::Command::StartJob(code),
                             Command::CancelJob => lasercraft_machine::Command::CancelJob,
+                            Command::Stop => lasercraft_machine::Command::Stop,
+                            Command::Unlock => lasercraft_machine::Command::Unlock,
+                            Command::Home => lasercraft_machine::Command::Home,
                             Command::Disconnect => continue,
                         };
                         match c.command(command, now) {
@@ -205,9 +232,17 @@ mod tests {
         let Ok(Event::Status(s)) = rx.try_recv() else { panic!("a status") };
         assert_eq!((s.state.as_str(), s.machine_position), ("Alarm", Some([1.0, 2.0, 0.0])));
         assert!(s.alarm.is_some());
+        // An alarmed machine refuses a job; an idle one runs it.
+        assert!(c.command(lasercraft_machine::Command::StartJob("G21\nG90".into()), t).is_err());
+        let mut c = Controller::new(SimulatedGrbl::default(), StreamMode::LineByLine);
+        assert!(!forward(&tx, c.poll(t), &c, &mut identity));
+        let _ = rx.try_recv();
         let events = c.command(lasercraft_machine::Command::StartJob("G21\nG90".into()), t).unwrap();
         assert!(!forward(&tx, events, &c, &mut identity));
-        assert!(matches!(rx.try_recv(), Ok(Event::JobProgress(_))));
+        // (After a warning that the settings weren't read.)
+        let got: Vec<Event> = rx.try_iter().collect();
+        assert!(got.iter().any(|e| matches!(e, Event::JobProgress(_))), "{got:?}");
+        assert!(got.iter().any(|e| matches!(e, Event::Line(l) if l.starts_with("Warning:"))), "{got:?}");
         assert!(forward(&tx, vec![lasercraft_machine::Event::Lost("unplugged".into())], &c, &mut identity));
         assert!(rx.try_iter().any(|e| matches!(e, Event::Disconnected(w) if w == "unplugged")));
     }

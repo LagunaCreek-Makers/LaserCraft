@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::Transport;
-use crate::grbl::{self, Progress, Response, Settings, Status, StreamMode, Streamer, codes, realtime};
+use crate::grbl::{self, Expect, Progress, Response, Settings, State, Status, StreamMode, Streamer, codes, realtime};
 
 /// The longest jog, and its fastest feed.
 pub const MAX_JOG_MM: f64 = 10.0;
@@ -14,6 +14,10 @@ pub const MAX_JOG_FEED: f64 = 1000.0;
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Status reports are asked for this often.
 pub const STATUS_EVERY: Duration = Duration::from_millis(500);
+/// A status report older than this isn't trusted to start a job.
+pub const STATUS_FRESH: Duration = Duration::from_secs(2);
+/// A stop resets the controller once it has halted, or after this long.
+pub const STOP_RESET_AFTER: Duration = Duration::from_millis(1500);
 /// The longest line kept from the controller (a stream of bytes without line ends is noise).
 const MAX_INCOMING: usize = 4096;
 
@@ -26,8 +30,15 @@ pub enum Command {
     Settings,
     /// Feed hold.
     Hold,
-    /// Resume after a feed hold.
+    /// Resume after a feed hold (refused unless the machine is held).
     Resume,
+    /// Stop: no more lines, a feed hold, then a soft reset once the machine has halted (the
+    /// laser goes off and the buffers are cleared; the position is kept).
+    Stop,
+    /// `$X`: clear an alarm lock (after checking the machine).
+    Unlock,
+    /// `$H`: home the machine.
+    Home,
     Jog {
         axis: char,
         distance_mm: f64,
@@ -61,6 +72,12 @@ pub struct Controller<T: Transport> {
     pub status: Option<Status>,
     /// The last work offset reported (reports carry it now and then).
     pub offset: Option<[f64; 3]>,
+    /// When the last status report came.
+    status_at: Option<Instant>,
+    /// What jobs are made for (the machine profile), checked before each start.
+    pub expect: Expect,
+    /// A stop waiting to reset the controller (since when).
+    stopping: Option<Instant>,
     lost: bool,
 }
 
@@ -75,6 +92,9 @@ impl<T: Transport> Controller<T> {
             settings: Settings::default(),
             status: None,
             offset: None,
+            status_at: None,
+            expect: Expect::default(),
+            stopping: None,
             lost: false,
         }
     }
@@ -132,7 +152,26 @@ impl<T: Transport> Controller<T> {
                 self.send(&[realtime::HOLD], &mut events);
             }
             Command::Resume => {
+                if !self.status.as_ref().is_some_and(|s| matches!(s.state, State::Hold(_) | State::Door(0))) {
+                    return Err("resume works only while the machine is held".into());
+                }
                 self.send(&[realtime::RESUME], &mut events);
+            }
+            Command::Stop => {
+                if let Some(j) = self.job.as_mut().filter(|j| j.progress.active()) {
+                    j.fail("stopped by the operator");
+                    events.push(Event::JobProgress(j.progress.clone()));
+                }
+                if self.send(&[realtime::HOLD], &mut events) {
+                    self.stopping = Some(now);
+                }
+            }
+            Command::Unlock | Command::Home if busy => return Err("not while a job runs".into()),
+            Command::Unlock => {
+                self.send(b"$X\n", &mut events);
+            }
+            Command::Home => {
+                self.send(b"$H\n", &mut events);
             }
             Command::Jog { .. } if busy => return Err("jogging is off while a job runs".into()),
             Command::Jog { axis, distance_mm, feed_mm_min } => {
@@ -141,6 +180,13 @@ impl<T: Transport> Controller<T> {
             }
             Command::StartJob(_) if busy => return Err("a job is already running".into()),
             Command::StartJob(code) => {
+                let lines = grbl::job_lines(&code)?;
+                let fresh = self.status_at.is_some_and(|t| now.saturating_duration_since(t) <= STATUS_FRESH);
+                let check = grbl::preflight(&lines, self.status.as_ref(), fresh, &self.settings, &self.expect);
+                if !check.ok() {
+                    return Err(format!("can't start: {}", check.blockers.join("; ")));
+                }
+                events.extend(check.warnings.into_iter().map(|w| Event::Line(format!("Warning: {w}"))));
                 let job = Streamer::new(&code, self.mode)?;
                 events.push(Event::JobProgress(job.progress.clone()));
                 self.job = Some(job);
@@ -212,6 +258,17 @@ impl<T: Transport> Controller<T> {
             }
         }
         self.pump(now, &mut events);
+        // A stop resets the controller once it has halted (or after a while): the laser goes off.
+        if let Some(since) = self.stopping {
+            let halted = self.status.as_ref().is_some_and(|s| matches!(s.state, State::Hold(0) | State::Idle | State::Alarm | State::Door(_)));
+            if halted || now.saturating_duration_since(since) >= STOP_RESET_AFTER {
+                self.stopping = None;
+                if !self.send(&[realtime::SOFT_RESET], &mut events) {
+                    return events;
+                }
+                events.push(Event::Line("Stopped: soft reset sent (laser off, buffers cleared)".into()));
+            }
+        }
         if let Some(j) = self.job.as_mut()
             && j.timed_out(now, ACK_TIMEOUT)
         {
@@ -232,6 +289,7 @@ impl<T: Transport> Controller<T> {
                     self.offset = s.offset;
                 }
                 self.status = Some((*s).clone());
+                self.status_at = Some(now);
                 events.push(Event::Status(s));
                 return;
             }
@@ -294,6 +352,7 @@ mod tests {
         for mode in [StreamMode::LineByLine, StreamMode::CharacterCounting] {
             let mut t = Instant::now();
             let mut c = Controller::new(SimulatedGrbl::default(), mode);
+            c.poll(t);
             c.command(Command::StartJob(job(200)), t).unwrap();
             run(&mut c, &mut t, 10_000);
             let p = c.progress().unwrap();
@@ -306,6 +365,7 @@ mod tests {
         let polls = |mode| {
             let mut t = Instant::now();
             let mut c = Controller::new(SimulatedGrbl { lines_per_read: 8, ..SimulatedGrbl::default() }, mode);
+            c.poll(t);
             c.command(Command::StartJob(job(200)), t).unwrap();
             let mut n = 0;
             while c.job_active() && n < 10_000 {
@@ -322,6 +382,7 @@ mod tests {
     fn errors_and_alarms_stop_the_job_with_their_meaning() {
         let mut t = Instant::now();
         let mut c = Controller::new(SimulatedGrbl { reject_at: Some(5), ..SimulatedGrbl::default() }, StreamMode::LineByLine);
+        c.poll(t);
         c.command(Command::StartJob(job(20)), t).unwrap();
         let events = run(&mut c, &mut t, 1000);
         let p = c.progress().unwrap();
@@ -329,19 +390,31 @@ mod tests {
         assert_eq!(p.acknowledged, 4);
         assert!(events.iter().any(|e| matches!(e, Event::Line(l) if l.starts_with("error:2 ("))));
         let mut c = Controller::new(SimulatedGrbl { alarm_at: Some((3, 2)), ..SimulatedGrbl::default() }, StreamMode::CharacterCounting);
+        c.poll(t);
         c.command(Command::StartJob(job(20)), t).unwrap();
         run(&mut c, &mut t, 1000);
         assert!(c.progress().unwrap().failed.as_deref().unwrap().contains("soft limit"));
-        // Locked by the alarm: the controller refuses the next job's lines.
+        // Locked by the alarm: the next job doesn't start.
+        t += Duration::from_millis(600);
+        c.poll(t);
+        let e = c.command(Command::StartJob(job(2)), t).unwrap_err();
+        assert!(e.contains("alarm"), "{e}");
+        // Unlocked: it goes.
+        c.command(Command::Unlock, t).unwrap();
+        t += Duration::from_millis(600);
+        c.poll(t);
+        t += Duration::from_millis(600);
+        c.poll(t);
         c.command(Command::StartJob(job(2)), t).unwrap();
         run(&mut c, &mut t, 1000);
-        assert!(c.progress().unwrap().failed.as_deref().unwrap().starts_with("error:9"));
+        assert!(c.progress().unwrap().finished);
     }
 
     #[test]
     fn a_lost_answer_times_the_job_out_and_loses_the_link() {
         let mut t = Instant::now();
         let mut c = Controller::new(SimulatedGrbl { silence_at: Some(2), ..SimulatedGrbl::default() }, StreamMode::LineByLine);
+        c.poll(t);
         c.command(Command::StartJob(job(5)), t).unwrap();
         let events = run(&mut c, &mut t, 100);
         assert!(c.job_active(), "still waiting within the timeout");
@@ -388,6 +461,76 @@ mod tests {
     }
 
     #[test]
+    fn starts_are_gated_on_a_fresh_idle_status_and_the_settings() {
+        let mut t = Instant::now();
+        let mut c = Controller::new(SimulatedGrbl::default(), StreamMode::LineByLine);
+        assert!(c.command(Command::StartJob(job(2)), t).unwrap_err().contains("no recent status"));
+        c.poll(t);
+        // Stale: more than STATUS_FRESH since the last report.
+        let late = t + STATUS_FRESH + Duration::from_millis(1);
+        assert!(c.command(Command::StartJob(job(2)), late).is_err());
+        // Settings read: laser mode off blocks; a different power range warns.
+        let sim = SimulatedGrbl { settings: vec![(32, 0.0), (30, 255.0), (130, 400.0), (131, 300.0)], ..SimulatedGrbl::default() };
+        let mut c = Controller::new(sim, StreamMode::LineByLine);
+        c.expect = grbl::Expect { max_s: Some(1000.0), bed: Some((400.0, 300.0)) };
+        c.command(Command::Settings, t).unwrap();
+        t += Duration::from_millis(600);
+        c.poll(t);
+        assert!(c.command(Command::StartJob(job(2)), t).unwrap_err().contains("laser mode"));
+        let sim = SimulatedGrbl { settings: vec![(32, 1.0), (30, 255.0), (130, 400.0), (131, 300.0)], ..SimulatedGrbl::default() };
+        let mut c = Controller::new(sim, StreamMode::LineByLine);
+        c.expect = grbl::Expect { max_s: Some(1000.0), bed: Some((400.0, 300.0)) };
+        c.command(Command::Settings, t).unwrap();
+        t += Duration::from_millis(600);
+        c.poll(t);
+        let events = c.command(Command::StartJob(job(2)), t).unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::Line(l) if l.starts_with("Warning:") && l.contains("S255"))));
+    }
+
+    #[test]
+    fn stop_holds_then_resets_and_resume_needs_a_hold() {
+        let mut t = Instant::now();
+        let mut c = Controller::new(SimulatedGrbl::default(), StreamMode::LineByLine);
+        c.poll(t);
+        assert!(c.command(Command::Resume, t).unwrap_err().contains("held"));
+        c.command(Command::StartJob(job(50)), t).unwrap();
+        run(&mut c, &mut t, 5);
+        let events = c.command(Command::Stop, t).unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::JobProgress(p) if p.failed.as_deref() == Some("stopped by the operator"))));
+        assert_eq!(c.link().realtime.last(), Some(&realtime::HOLD));
+        // The status shows the hold: then the reset (laser off).
+        t += STATUS_EVERY;
+        let events = c.poll(t);
+        t += STATUS_EVERY;
+        let events: Vec<Event> = events.into_iter().chain(c.poll(t)).collect();
+        assert_eq!(c.link().realtime.last(), Some(&realtime::SOFT_RESET));
+        assert!(events.iter().any(|e| matches!(e, Event::Line(l) if l.starts_with("Stopped"))));
+        assert!(!c.job_active());
+        // No status (a silent controller): the reset still comes after STOP_RESET_AFTER.
+        struct Mute(Vec<u8>);
+        impl Transport for Mute {
+            fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+                self.0.extend_from_slice(b);
+                Ok(())
+            }
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        let mut c = Controller::new(Mute(vec![]), StreamMode::LineByLine);
+        c.command(Command::Stop, t).unwrap();
+        c.poll(t);
+        assert!(!c.link().0.contains(&realtime::SOFT_RESET));
+        c.poll(t + STOP_RESET_AFTER);
+        assert_eq!(c.link().0.last(), Some(&realtime::SOFT_RESET));
+        // Unlock and home are refused during a job.
+        let mut c = Controller::new(SimulatedGrbl::default(), StreamMode::LineByLine);
+        c.poll(t);
+        c.command(Command::StartJob(job(50)), t).unwrap();
+        assert!(c.command(Command::Unlock, t).is_err() && c.command(Command::Home, t).is_err());
+    }
+
+    #[test]
     fn a_restart_or_a_broken_link_ends_the_job() {
         struct Broken;
         impl Transport for Broken {
@@ -406,6 +549,7 @@ mod tests {
         // A soft reset mid-job (a welcome line) fails the job.
         let mut t = Instant::now();
         let mut c = Controller::new(SimulatedGrbl::default(), StreamMode::LineByLine);
+        c.poll(t);
         c.command(Command::StartJob(job(10)), t).unwrap();
         c.poll(t);
         let sim_reset = |c: &mut Controller<SimulatedGrbl>| c.link.write_all(&[realtime::SOFT_RESET]).unwrap();

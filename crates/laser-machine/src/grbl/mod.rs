@@ -4,10 +4,12 @@
 //! ([`Streamer`]).
 
 pub mod codes;
+mod preflight;
 mod response;
 mod settings;
 mod stream;
 
+pub use preflight::{Expect, Preflight, job_extent, preflight};
 pub use response::{Response, State, Status, parse_response};
 pub use settings::Settings;
 pub use stream::{Progress, RX_BUFFER, StreamMode, Streamer};

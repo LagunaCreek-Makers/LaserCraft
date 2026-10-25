@@ -883,13 +883,17 @@ impl LaserPanel {
      for port in &self.detected_ports {ui.selectable_value(&mut self.connection_port,port.clone(),port);}
     });
     ui.horizontal(|ui|{
-     if self.monitor.is_none(){if ui.add_enabled(self.controller=="GRBL" && !self.connection_port.is_empty(),egui::Button::new("Connect GRBL")).clicked(){self.monitor=Some(Monitor::connect(self.connection_port.clone(),self.connection_baud));}}
+     if self.monitor.is_none(){if ui.add_enabled(self.controller=="GRBL" && !self.connection_port.is_empty(),egui::Button::new("Connect GRBL")).clicked(){let expect=lasercraft_machine::grbl::Expect{max_s:Some(f64::from(self.max_s)),bed:Some((self.machine_width,self.machine_height))};self.monitor=Some(Monitor::connect(self.connection_port.clone(),self.connection_baud,expect));}}
      else if ui.button("Disconnect").clicked()&& let Some(m)=&self.monitor{m.disconnect();}
     });
     ui.separator();
     ui.label("Phase 9 | GRBL 1.1 supervised control (EXPERIMENTAL)");
     ui.horizontal(|ui|{if ui.button("Identify ($I)").clicked()&& let Some(m)=&self.monitor{m.identify();}
       if ui.button("Read settings ($$)").clicked()&& let Some(m)=&self.monitor{m.settings();}});
+    // Unlocking clears an alarm's lock and homing moves the machine: both need motion enabled.
+    ui.horizontal(|ui|{let can=self.motion_unlocked && self.monitor.is_some();
+      if ui.add_enabled(can,egui::Button::new("Unlock ($X)")).on_hover_text("Clear an alarm lock after checking the machine").clicked()&& let Some(m)=&self.monitor{m.unlock();}
+      if ui.add_enabled(can,egui::Button::new("Home ($H)")).on_hover_text("The machine moves to its home switches").clicked()&& let Some(m)=&self.monitor{m.home();}});
     ui.horizontal(|ui|{if ui.button("Feed hold (!)").clicked()&& let Some(m)=&self.monitor{m.hold();}
       if ui.button("Resume (~)").clicked()&& let Some(m)=&self.monitor{m.resume();}});
     ui.checkbox(&mut self.motion_unlocked,"Enable supervised jogging (machine can move)");
@@ -909,6 +913,7 @@ impl LaserPanel {
     ui.horizontal(|ui|{
      if ui.add_enabled(can_start,egui::Button::new("START LASER JOB")).clicked()&& let Some(_m)=&self.monitor{match self.coordinator.start(&self.accessory_config,self.generated_gcode.clone()){Ok(())=>{self.stream_armed=false;self.stream_progress=None;self.message="Starting independent accessories before job".into();},Err(e)=>self.message=e}}
      if ui.add_enabled(job_active,egui::Button::new("Cancel / feed hold")).clicked()&& let Some(m)=&self.monitor{m.cancel_job();self.coordinator.shutdown();}
+     if ui.add_enabled(self.monitor.is_some(),egui::Button::new("STOP (hold, then reset)")).on_hover_text("Feed hold, then a soft reset once halted: the laser goes off and the job is dropped. Not an emergency stop.").clicked()&& let Some(m)=&self.monitor{m.stop();self.coordinator.shutdown();}
     });
     ui.label(format!("Independent accessory coordinator: {:?}",self.coordinator.stage));
     if self.coordinator.stage==Stage::Fault && ui.button("Acknowledge accessory fault (verify hardware OFF first)").clicked(){self.coordinator.reset_fault();}
