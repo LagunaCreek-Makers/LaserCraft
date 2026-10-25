@@ -4,11 +4,13 @@
 //! ([`Streamer`]).
 
 pub mod codes;
+mod estimate;
 mod preflight;
 mod response;
 mod settings;
 mod stream;
 
+pub use estimate::{Estimate, Motion, estimate};
 pub use preflight::{Expect, Preflight, job_extent, preflight};
 pub use response::{Response, State, Status, parse_response};
 pub use settings::Settings;

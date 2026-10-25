@@ -68,6 +68,8 @@ pub struct LaserPanel {
     machine_width: f64,
     machine_height: f64,
     max_s: u32,
+    /// The machine's fastest move (mm/min), for time estimates (its profile's `max_rate`).
+    max_rate: f64,
     /// The corner the machine counts from (saved in its profile as `origin`).
     machine_origin: Origin,
     /// The name of the machine profile loaded (Load machine, or saved): jobs from the document
@@ -140,6 +142,7 @@ impl Default for LaserPanel {
             machine_width: 300.0,
             machine_height: 200.0,
             max_s: 1000,
+            max_rate: 6000.0,
             machine_origin: Origin::BottomLeft,
             loaded_profile: None,
             doc_export: DocExport::default(),
@@ -267,6 +270,8 @@ impl LaserPanel {
             self.machine_width = p["width_mm"].as_f64().unwrap_or(300.0).clamp(1.0, 10000.0);
             self.machine_height = p["height_mm"].as_f64().unwrap_or(200.0).clamp(1.0, 10000.0);
             self.max_s = p["max_s"].as_u64().unwrap_or(1000).clamp(1, 100000) as u32;
+            self.max_rate = p["max_rate"].as_f64().filter(|v| v.is_finite()).unwrap_or(6000.0).clamp(60.0, 200_000.0);
+            self.acceleration = p["acceleration"].as_f64().filter(|v| v.is_finite()).unwrap_or(500.0).clamp(10.0, 10_000.0);
             self.controller = p["controller"].as_str().unwrap_or("GRBL").to_owned();
             // Profiles saved before `origin` existed get their controller's usual corner.
             self.machine_origin = p["origin"].as_str().and_then(Origin::parse).unwrap_or_else(|| Origin::default_for(&self.controller));
@@ -316,6 +321,8 @@ impl LaserPanel {
         }
         let (prologue, epilogue) = job_hooks(&self.air_config, AirMode::Inherit, &self.accessory_config)?;
         Ok(Some(Bed {
+            max_rate: self.max_rate,
+            acceleration: self.acceleration,
             width_mm: self.machine_width,
             height_mm: self.machine_height,
             max_s: self.max_s,
@@ -523,7 +530,7 @@ impl LaserPanel {
     ui.horizontal(|ui|{ui.label("Port / address");ui.text_edit_singleline(&mut self.connection_port);});
     ui.horizontal(|ui|{ui.label("Baud (GRBL)");ui.add(egui::DragValue::new(&mut self.connection_baud).range(1200..=1000000));});
     if ui.button("Save current machine as new profile").clicked(){
-     self.profiles.push(json!({"name":format!("{} machine {}",self.controller,self.profiles.len()+1),"controller":self.controller,"width_mm":self.machine_width,"height_mm":self.machine_height,"max_s":self.max_s,"origin":self.machine_origin.id(),"port":self.connection_port,"baud":self.connection_baud,"air_assist":self.air_config,"accessories":self.accessory_config}));
+     self.profiles.push(json!({"name":format!("{} machine {}",self.controller,self.profiles.len()+1),"controller":self.controller,"width_mm":self.machine_width,"height_mm":self.machine_height,"max_s":self.max_s,"max_rate":self.max_rate,"acceleration":self.acceleration,"origin":self.machine_origin.id(),"port":self.connection_port,"baud":self.connection_baud,"air_assist":self.air_config,"accessories":self.accessory_config}));
      self.active_profile=self.profiles.len()-1;
      self.loaded_profile=self.profiles.last().and_then(|p|p["name"].as_str()).map(str::to_owned);
      self.message=match self.save_profiles(){Ok(())=>"Machine profile saved".into(),Err(e)=>format!("Save failed: {e}")};
@@ -962,6 +969,8 @@ impl LaserPanel {
     ui.horizontal(|ui|{ui.label("Bed width (mm)");ui.add(egui::DragValue::new(&mut self.machine_width).range(1.0..=10000.0));});
     ui.horizontal(|ui|{ui.label("Bed height (mm)");ui.add(egui::DragValue::new(&mut self.machine_height).range(1.0..=10000.0));});
     ui.horizontal(|ui|{ui.label("GRBL maximum S");ui.add(egui::DragValue::new(&mut self.max_s).range(1..=100000));});
+    ui.horizontal(|ui|{ui.label("Fastest move");ui.add(egui::DragValue::new(&mut self.max_rate).range(60.0..=200_000.0).suffix(" mm/min"));ui.label("Acceleration");ui.add(egui::DragValue::new(&mut self.acceleration).range(10.0..=10_000.0).suffix(" mm/s²"));})
+     .response.on_hover_text("For time estimates: GRBL's $110/$111 and $120/$121");
     ui.horizontal(|ui|{
      ui.label("Origin");
      egui::ComboBox::from_id_salt("lasercraft_machine_origin").selected_text(self.machine_origin.label()).show_ui(ui,|ui|{
@@ -971,7 +980,7 @@ impl LaserPanel {
     ui.small("The corner the machine homes to and counts from; G-code from the document is placed from that corner of the artboard.");
     if ui.button("Save to selected machine").clicked(){
      if let Some(p)=self.profiles.get_mut(self.active_profile){
-      p["width_mm"]=json!(self.machine_width);p["height_mm"]=json!(self.machine_height);p["max_s"]=json!(self.max_s);p["origin"]=json!(self.machine_origin.id());
+      p["width_mm"]=json!(self.machine_width);p["height_mm"]=json!(self.machine_height);p["max_s"]=json!(self.max_s);p["max_rate"]=json!(self.max_rate);p["acceleration"]=json!(self.acceleration);p["origin"]=json!(self.machine_origin.id());
       self.message=match self.save_profiles(){Ok(())=>"Machine profile saved".into(),Err(e)=>format!("Save failed: {e}")};
      } else {self.message="Select a machine first".into();}
     }
@@ -1021,9 +1030,11 @@ impl LaserPanel {
     let n=sim.steps.len();
     if n>0 {
      let duration=sim.duration_seconds;
-     ui.horizontal(|ui|{ui.label("Acceleration mm/s²");ui.add(egui::Slider::new(&mut self.acceleration,10.0..=10000.0).logarithmic(true));});
-     let estimate=laser_sim::estimated_motion_time(&sim,laser_sim::MotionEstimate{acceleration_mm_s2:self.acceleration,rapid_mm_min:3000.0});
-     ui.label(format!("Nominal {:.1}s | stop-at-each-move estimate {:.1}s (no junction look-ahead)",duration,estimate));
+     // Planned with acceleration and corner speeds (look-ahead), from the machine profile's limits.
+     let motion=lasercraft_machine::grbl::Motion{max_rate:[self.max_rate;2],acceleration:[self.acceleration;2],..Default::default()};
+     let est=lasercraft_machine::grbl::estimate(&self.sim_source,&motion);
+     ui.label(format!("Estimated job time {} ({:.0} mm burning, {:.0} mm travel) | nominal feed time {}",laser_doc::duration(est.seconds),est.burn_mm,est.travel_mm,laser_doc::duration(duration)));
+     ui.small(format!("With the machine profile's fastest move ({:.0} mm/min) and acceleration ({:.0} mm/s²); the real time is somewhat longer.",self.max_rate,self.acceleration));
      ui.horizontal(|ui|{ui.label("Exposure resolution");ui.add(egui::Slider::new(&mut self.exposure_resolution,40..=200));ui.checkbox(&mut self.exposure_grayscale,"Grayscale exposure");});
      if self.sim_playing {
       let dt=ctx.input(|i|i.stable_dt).min(0.1) as f64;
@@ -1232,7 +1243,16 @@ mod tests {
         p.active_profile = 0;
         p.apply_machine();
         assert_eq!(p.loaded_profile.as_deref(), Some("Shop CO2"));
-        let bed = Bed { width_mm: 600.0, height_mm: 400.0, max_s: 1000, origin: Origin::TopRight, prologue: vec![], epilogue: vec![] };
+        let bed = Bed {
+            width_mm: 600.0,
+            height_mm: 400.0,
+            max_s: 1000,
+            origin: Origin::TopRight,
+            prologue: vec![],
+            epilogue: vec![],
+            max_rate: 6000.0,
+            acceleration: 500.0,
+        };
         assert_eq!(p.bed(), Ok(Some(bed.clone())));
         // With air assist on, the bed carries its G-code for the command.
         p.air_config = AirConfig { enabled: true, default_on: true, ..AirConfig::default() };

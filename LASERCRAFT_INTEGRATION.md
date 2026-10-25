@@ -128,3 +128,16 @@ feed hold, then a soft reset once the machine has halted (or after 1.5 s): the l
 the buffers are cleared. **Resume** works only while the machine is held. **Unlock** (`$X`) and
 **Home** (`$H`) are refused during a job; the panel enables them only with motion enabled. None
 of this replaces a hardware emergency stop or interlocks.
+
+### Job time estimate
+
+`lasercraft_machine::grbl::estimate` plans a job's moves the way a motion controller does: each
+move with a trapezoidal speed profile, corner speeds from the junction deviation, and a look-ahead
+over the whole job (moves start and end at rest only where they must: reversals, dwells, the
+start and end). Rapids run at the maximum rate; overscan, passes and air-assist dwells are in the
+G-code, so they count. The limits come from GRBL's `$110/$111`, `$120/$121` and `$11` when read,
+else the machine profile's `max_rate` and `acceleration` (set in the panel's Machine profile
+section), else 6000 mm/min and 1000 mm/s². `laser.exportGcode` returns
+`estimate: {seconds, burnMm, travelMm, moves}` (params `maxRate`, `acceleration`; `vectorcraft-cli
+run --machine` passes the profile's), the panel shows it after Generate/Export and in the dry run.
+It is an estimate: the controller's buffer and the serial link make the real time somewhat longer.

@@ -4772,6 +4772,7 @@ dependencies = [
  "kurbo 0.13.1",
  "lasercraft-cam",
  "lasercraft-core",
+ "lasercraft-machine",
  "log",
  "proptest",
  "roxmltree 0.21.1",

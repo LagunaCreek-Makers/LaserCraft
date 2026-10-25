@@ -24,6 +24,22 @@ pub struct Bed {
     pub origin: Origin,
     pub prologue: Vec<String>,
     pub epilogue: Vec<String>,
+    /// The fastest move (mm/min) and the acceleration (mm/s²), for the time estimate.
+    pub max_rate: f64,
+    pub acceleration: f64,
+}
+
+/// `seconds` as people read a job's length: "42 s", "3 min 05 s", "1 h 02 min".
+pub fn duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "unknown".into();
+    }
+    let s = seconds.round() as u64;
+    match s {
+        0..=59 => format!("{s} s"),
+        60..=3599 => format!("{} min {:02} s", s / 60, s % 60),
+        _ => format!("{} h {:02} min", s / 3600, (s % 3600 + 30) / 60 % 60),
+    }
 }
 
 /// Where machine point (`x`, `y`) mm lies on screen when the bed (`w` × `h` mm, centred on
@@ -48,6 +64,8 @@ pub fn export_params(bed: Option<&Bed>, selection_only: bool, tolerance: f64, pa
         p["origin"] = json!(b.origin.id());
         p["prologue"] = json!(b.prologue);
         p["epilogue"] = json!(b.epilogue);
+        p["maxRate"] = json!(b.max_rate);
+        p["acceleration"] = json!(b.acceleration);
     }
     if let Some(path) = path {
         p["path"] = json!(path);
@@ -173,9 +191,10 @@ impl DocExport {
                     contours: r["contours"].as_u64().unwrap_or(0),
                     path: r["path"].as_str().map(str::to_string),
                 };
+                let time = r["estimate"]["seconds"].as_f64().map(|s| format!(", about {}", duration(s))).unwrap_or_default();
                 self.status = match &g.path {
-                    Some(p) => format!("Wrote {} ({} cuts). Review it before running it.", p, g.contours),
-                    None => format!("{} cuts from the document. Review the dry run before running it.", g.contours),
+                    Some(p) => format!("Wrote {} ({} cuts{time}). Review it before running it.", p, g.contours),
+                    None => format!("{} cuts from the document{time}. Review the dry run before running it.", g.contours),
                 };
                 Some(g)
             }
@@ -362,7 +381,24 @@ mod tests {
         }
     }
 
-    const BED: Bed = Bed { width_mm: 300.0, height_mm: 300.0, max_s: 1000, origin: Origin::BottomLeft, prologue: Vec::new(), epilogue: Vec::new() };
+    const BED: Bed = Bed {
+        width_mm: 300.0,
+        height_mm: 300.0,
+        max_s: 1000,
+        origin: Origin::BottomLeft,
+        prologue: Vec::new(),
+        epilogue: Vec::new(),
+        max_rate: 6000.0,
+        acceleration: 1000.0,
+    };
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(duration(42.4), "42 s");
+        assert_eq!(duration(185.0), "3 min 05 s");
+        assert_eq!(duration(3725.0), "1 h 02 min");
+        assert_eq!(duration(f64::NAN), "unknown");
+    }
 
     #[test]
     fn bed_corners_land_where_each_origin_says() {
@@ -386,7 +422,7 @@ mod tests {
         let p = export_params(Some(&Bed { origin: Origin::TopRight, ..BED }), true, 0.1, Some("a.gcode"));
         assert_eq!(
             p,
-            json!({"selectionOnly": true, "tolerance": 0.1, "bedWidth": 300.0, "bedHeight": 300.0, "maxS": 1000, "origin": "topRight", "prologue": [], "epilogue": [], "path": "a.gcode"})
+            json!({"selectionOnly": true, "tolerance": 0.1, "bedWidth": 300.0, "bedHeight": 300.0, "maxS": 1000, "origin": "topRight", "prologue": [], "epilogue": [], "maxRate": 6000.0, "acceleration": 1000.0, "path": "a.gcode"})
         );
         assert!(export_params(None, false, 0.05, None).get("bedWidth").is_none());
     }

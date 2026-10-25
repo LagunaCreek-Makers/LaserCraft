@@ -109,7 +109,7 @@ fn machine_profiles_give_the_bed_and_origin() {
         "machines": [
             // Saved before profiles had an origin: the controller's usual corner.
             {"name": "GRBL 300 x 200", "controller": "GRBL", "width_mm": 300.0, "height_mm": 200.0, "max_s": 1000, "port": "", "baud": 115200},
-            {"name": "Shop CO2", "controller": "Ruida", "width_mm": 600.0, "height_mm": 400.0},
+            {"name": "Shop CO2", "controller": "Ruida", "width_mm": 600.0, "height_mm": 400.0, "max_rate": 12000, "acceleration": 2000},
             {"name": "Diode", "controller": "GRBL", "width_mm": 400.0, "height_mm": 400.0, "max_s": 255, "origin": "topLeft"},
             {"name": "Broken", "width_mm": -5.0, "height_mm": 400.0}
         ]
@@ -120,6 +120,8 @@ fn machine_profiles_give_the_bed_and_origin() {
     assert_eq!((grbl.width_mm, grbl.height_mm, grbl.max_s, grbl.origin), (300.0, 200.0, 1000, Origin::BottomLeft));
     let co2 = find_machine(&profiles, "Shop CO2").unwrap();
     assert_eq!((co2.max_s, co2.origin), (1000, Origin::TopRight));
+    assert_eq!((co2.max_rate, co2.acceleration), (Some(12000.0), Some(2000.0)));
+    assert_eq!((grbl.max_rate, grbl.acceleration), (None, None));
     assert_eq!(find_machine(&profiles, "Diode").unwrap().origin, Origin::TopLeft);
     assert!(find_machine(&profiles, "Broken").unwrap_err().contains("width_mm"));
     assert!(find_machine(&profiles, "Nope").unwrap_err().contains("Shop CO2"));

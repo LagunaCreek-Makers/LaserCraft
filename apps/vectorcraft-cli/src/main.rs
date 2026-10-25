@@ -351,6 +351,13 @@ fn with_machine(params: &mut Value, m: &lasercraft_cam::MachineProfile) {
     // Its air-assist and accessory G-code, as the laser panel adds them to the jobs it runs.
     o.entry("prologue").or_insert(json!(m.prologue));
     o.entry("epilogue").or_insert(json!(m.epilogue));
+    // Its motion limits, for the time estimate.
+    if let Some(r) = m.max_rate {
+        o.entry("maxRate").or_insert(json!(r));
+    }
+    if let Some(a) = m.acceleration {
+        o.entry("acceleration").or_insert(json!(a));
+    }
 }
 
 fn run(args: &[String]) -> Result<(), String> {
